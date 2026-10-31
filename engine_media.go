@@ -483,6 +483,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// different failure and is not a census.
 	census := newMediaCensus(callID, inbound)
 	censusStarted := time.Now()
+	// TEMPORARY #40, patch 5: the allocate transaction id as built at
+	// connect. Every 1 Hz refresh is compared against it, because SendCurrent
+	// replays the stored packet verbatim and a relay may read a repeated
+	// transaction id as a retransmission or as a conflicting re-allocation.
+	// Recorded, not changed.
+	census.allocateInitialTx(allocateState.CurrentTransactionID())
 	go func() {
 		t := time.NewTicker(mediaCensusInterval)
 		defer t.Stop()
@@ -582,6 +588,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					return
 				}
 			}
+			// TEMPORARY #40, patch 5. Read AFTER the send, so the id recorded
+			// is the one that went out: the group path rebuilds the packet
+			// with a fresh transaction id, the direct path replays the
+			// initial one, and which of those happened is the thing being
+			// measured.
+			census.allocateRefreshSent(allocateState.CurrentTransactionID())
 			_, _ = ch.Send(ping[:])
 			tickCount++
 			e.c.diag.Emit("stun", map[string]any{
@@ -933,8 +945,36 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			})
 			continue
 		case relay.RelayPacketStun:
-			mt, isStun := stun.StunMessageType(pkt)
-			if isStun && mt == stun.MsgBindingRequest {
+			// TEMPORARY #40, patch 5: classify the datagram before acting on
+			// it. Until this, the loop tested only for MsgBindingRequest and
+			// let every other STUN type fall through to `continue` — so an
+			// allocate ERROR was indistinguishable from an allocate SUCCESS
+			// in every observable we had.
+			stunKind, stunCode, stunCodeFound, firstAllocateError :=
+				census.stunMessage(pkt, time.Since(censusStarted).Milliseconds())
+			if firstAllocateError {
+				// Loudly, and once per call. If this is the cause of the
+				// inbound-audio bug, nobody should have to read a periodic
+				// census line to find out.
+				log.Error().
+					Str("call_id", callID).
+					Uint16("stun_error_code", stunCode).
+					Bool("stun_error_code_present", stunCodeFound).
+					Int64("elapsed_ms", time.Since(censusStarted).Milliseconds()).
+					Str("allocate_tx_initial", allocateState.CurrentTransactionID()).
+					Msg("relay REFUSED our allocate (first this call) — the media bridge is gone while the socket stays alive")
+				e.c.diag.Emit("stun", map[string]any{
+					"event": "allocate_error", "call_id": callID,
+					"error_code": stunCode, "error_code_present": stunCodeFound,
+					"elapsed_ms": time.Since(censusStarted).Milliseconds(),
+				})
+				// Through the observer too, immediately rather than at the
+				// next 5 s tick: the integrator reads the census event, and a
+				// refusal that is five seconds late is five seconds of
+				// guessing. Not final — the call is still running.
+				e.reportMediaCensus(census.snapshot(time.Since(censusStarted).Milliseconds(), false))
+			}
+			if stunKind == CensusStunBindingRequest {
 				resp, answered, err := allocateState.SendBindingSuccess(pkt, func(packet []byte) error {
 					_, sendErr := ch.Send(packet)
 					return sendErr

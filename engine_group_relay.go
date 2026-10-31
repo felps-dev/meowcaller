@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"sync"
 
@@ -35,6 +36,24 @@ func (s *groupRelayAllocateState) Current() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return bytes.Clone(s.packet)
+}
+
+// CurrentTransactionID is the hex transaction id of the allocate packet
+// SendCurrent would send right now.
+//
+// TEMPORARY (upstream issue #40), read-only: SendCurrent replays the stored
+// packet verbatim, so a refresh carries whatever transaction id the INITIAL
+// allocate was built with, and a relay may read that repetition as a
+// retransmission or as a conflicting re-allocation. This exposes the id so
+// the census can report it; it does not change what is sent.
+func (s *groupRelayAllocateState) CurrentTransactionID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tx, ok := stun.StunTransactionID(s.packet)
+	if !ok {
+		return ""
+	}
+	return hex.EncodeToString(tx)
 }
 
 func (s *groupRelayAllocateState) SendCurrent(send func([]byte) error) error {

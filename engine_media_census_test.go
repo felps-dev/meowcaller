@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/purpshell/meowcaller/stun"
 )
 
 // TestTheCensusCountsEachStageSeparately is the whole point of the file in one
@@ -226,6 +228,18 @@ func TestTheEmittedCensusCarriesNoSecretOrPayload(t *testing.T) {
 		"failures": true, "frames_decoded": true, "seq_regressions": true,
 		"first": true, "last": true, "seq": true, "roc": true, "ssrc": true,
 		"rtcp_auth_failures": true, "stun_bindings_answered": true,
+		// Patch 5 (#40): the STUN type breakdown, the allocate error codes
+		// and the two allocate transaction ids. Counters, message-type names
+		// and transaction ids — a transaction id is not a secret and is the
+		// point of the measurement.
+		"stun_types": true, "stun_other_types": true,
+		"allocate_errors": true, "first_allocate_error": true,
+		"code": true, "code_found": true,
+		"allocate_tx_initial": true, "allocate_tx_refresh": true,
+		"allocate_refreshes": true, "allocate_refresh_tx_reused": true,
+	}
+	for _, kind := range censusStunKinds {
+		allowed[kind] = true
 	}
 	for _, kind := range censusFailKinds {
 		allowed[kind] = true
@@ -298,5 +312,292 @@ func TestTheObserverIsOptional(t *testing.T) {
 	cfg.mediaCensusObserver(MediaCensus{CallID: "c1", Datagrams: 4})
 	if got.CallID != "c1" || got.Datagrams != 4 {
 		t.Fatalf("the observer did not receive the report: %+v", got)
+	}
+}
+
+// --- Patch 5 (#40): the STUN message-type census -------------------------
+//
+// NOT REPRODUCIBLE HERE, and this is the honest limit of these tests. There
+// is no relay in this module, no peer, and no captured vector of what the
+// WhatsApp relay actually answers to an allocate refresh. What the tests
+// below pin is that a datagram of each type is classified as that type and
+// not as another, and that an error code and the two transaction ids survive
+// to the emitted form. Whether the live relay refuses our refresh, and with
+// which code, is a question only a live call can answer: the call is the
+// instrument, and this is the gauge on it.
+
+// stunMessageOfType synthesises a STUN datagram of one message type.
+func stunMessageOfType(msgType uint16, attrs []byte) []byte {
+	var tx [12]byte
+	for i := range tx {
+		tx[i] = byte(i + 1)
+	}
+	return stun.EncodeStunRequest(msgType, tx, attrs, nil, false)
+}
+
+// stunErrorCodeAttr is an RFC 5389 ERROR-CODE attribute (0x0009): two reserved
+// bytes, then the class and the number that ParseStunErrorCode folds into
+// class*100+number.
+func stunErrorCodeAttr(code uint16) []byte {
+	value := []byte{0, 0, byte(code / 100), byte(code % 100)}
+	return append([]byte{0x00, 0x09, 0x00, byte(len(value))}, value...)
+}
+
+// TestTheStunClassifierNamesEveryMessageType is the measurement itself. Until
+// patch 5 the receive loop tested only for a binding request, so an allocate
+// ERROR and an allocate SUCCESS produced the same observable: none. The table
+// asserts each type is named, and — the part that matters — that no OTHER
+// type was counted, because a classifier that mistakes a refusal for an ack
+// would be worse than the silence it replaces.
+func TestTheStunClassifierNamesEveryMessageType(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"allocate success", stunMessageOfType(stun.MsgAllocateSuccess, nil), CensusStunAllocateSuccess},
+		{"allocate error", stunMessageOfType(stun.MsgAllocateError, stunErrorCodeAttr(437)), CensusStunAllocateError},
+		{"binding success", stunMessageOfType(stun.MsgBindingSuccess, nil), CensusStunBindingSuccess},
+		{"binding request", stunMessageOfType(stun.MsgBindingRequest, nil), CensusStunBindingRequest},
+		{"whatsapp pong", stunMessageOfType(stun.MsgWhatsappPong, nil), CensusStunPong},
+		{"an unanticipated type", stunMessageOfType(0x0105, nil), CensusStunOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyCensusStun(tc.data); got != tc.want {
+				t.Fatalf("classified as %q, want %q", got, tc.want)
+			}
+			c := newMediaCensus("c1", true)
+			kind, _, _, _ := c.stunMessage(tc.data, 1000)
+			if kind != tc.want {
+				t.Fatalf("stunMessage reported %q, want %q", kind, tc.want)
+			}
+			s := c.snapshot(1000, false)
+			if s.STUNTypes[tc.want] != 1 {
+				t.Fatalf("%q was not counted: %v", tc.want, s.STUNTypes)
+			}
+			// The premise beside the property: exactly one kind, so a
+			// classifier that counted two could not pass by counting the
+			// right one among them.
+			if len(s.STUNTypes) != 1 {
+				t.Fatalf("one datagram was counted as several types: %v", s.STUNTypes)
+			}
+		})
+	}
+}
+
+// TestTheStunTypeBreakdownSumsToTheStunCount keeps the two counters readable
+// together: a breakdown that does not add up leaves a reader unable to tell a
+// missing category from a lost datagram.
+func TestTheStunTypeBreakdownSumsToTheStunCount(t *testing.T) {
+	c := newMediaCensus("c1", true)
+	for _, data := range [][]byte{
+		stunMessageOfType(stun.MsgAllocateSuccess, nil),
+		stunMessageOfType(stun.MsgWhatsappPong, nil),
+		stunMessageOfType(stun.MsgWhatsappPong, nil),
+		stunMessageOfType(stun.MsgAllocateError, stunErrorCodeAttr(437)),
+	} {
+		c.datagram(len(data))
+		c.classified(censusClassSTUN)
+		c.stunMessage(data, 500)
+	}
+	s := c.snapshot(500, true)
+	var total uint64
+	for _, n := range s.STUNTypes {
+		total += n
+	}
+	if total != s.STUN || s.STUN != 4 {
+		fmt_ := s.STUNTypes
+		t.Fatalf("breakdown sums to %d, stun = %d: %v", total, s.STUN, fmt_)
+	}
+	if s.STUNTypes[CensusStunPong] != 2 {
+		t.Fatalf("the pong count is wrong: %v", s.STUNTypes)
+	}
+}
+
+// TestAnAllocateErrorCarriesItsCodeAndWhenItArrived pins the two fields the
+// next step is aimed by. The ELAPSED time is what separates "the refresh is
+// refused from the first tick" from "it worked and then stopped", and the
+// CODE is what names the fix — which is the next change, not this one.
+func TestAnAllocateErrorCarriesItsCodeAndWhenItArrived(t *testing.T) {
+	c := newMediaCensus("c1", true)
+
+	_, code, found, first := c.stunMessage(stunMessageOfType(stun.MsgAllocateError, stunErrorCodeAttr(437)), 1012)
+	if code != 437 || !found || !first {
+		t.Fatalf("the first refusal reported code=%d found=%t first=%t", code, found, first)
+	}
+	// A second refusal of a DIFFERENT code is counted, and does not rewrite
+	// the first: the first one is the one with the diagnostic clock on it.
+	_, code2, _, first2 := c.stunMessage(stunMessageOfType(stun.MsgAllocateError, stunErrorCodeAttr(486)), 2015)
+	if code2 != 486 {
+		t.Fatalf("the second refusal reported code=%d, want 486", code2)
+	}
+	if first2 {
+		// Loud-once: a three-minute call must not log a line per second.
+		t.Fatal("the second refusal was reported as the first one")
+	}
+	s := c.snapshot(2015, false)
+	if s.FirstAllocateError == nil {
+		t.Fatal("no first allocate error was recorded")
+	}
+	if s.FirstAllocateError.Code != 437 || !s.FirstAllocateError.CodeFound {
+		t.Fatalf("the first error was overwritten: %+v", s.FirstAllocateError)
+	}
+	if s.FirstAllocateError.ElapsedMS != 1012 {
+		t.Fatalf("elapsed = %d, want 1012 — without it a refusal cannot be placed on the clock",
+			s.FirstAllocateError.ElapsedMS)
+	}
+	if s.AllocateErrors["437"] != 1 || s.AllocateErrors["486"] != 1 {
+		t.Fatalf("the per-code counters are wrong: %v", s.AllocateErrors)
+	}
+
+	// A refusal with NO error-code attribute is still a refusal, and says so
+	// rather than claiming code 0 — 0 is not a STUN error code.
+	bare := newMediaCensus("c1", true)
+	_, code3, found3, _ := bare.stunMessage(stunMessageOfType(stun.MsgAllocateError, nil), 900)
+	if found3 || code3 != 0 {
+		t.Fatalf("a refusal with no ERROR-CODE claimed code=%d found=%t", code3, found3)
+	}
+	sb := bare.snapshot(900, false)
+	if sb.AllocateErrors["none"] != 1 {
+		t.Fatalf("a codeless refusal was not counted: %v", sb.AllocateErrors)
+	}
+	if sb.FirstAllocateError.CodeFound {
+		t.Fatalf("a codeless refusal reported a code: %+v", sb.FirstAllocateError)
+	}
+	if !strings.Contains(sb.FirstAllocateError.String(), "absent") {
+		t.Fatalf("the human form hides the missing code: %s", sb.FirstAllocateError.String())
+	}
+}
+
+// TestAnUnanticipatedStunTypeNamesItself: "other" with no raw type would
+// retire a hypothesis without testing it, which is the mistake the absent
+// replay counter was introduced to avoid.
+func TestAnUnanticipatedStunTypeNamesItself(t *testing.T) {
+	c := newMediaCensus("c1", true)
+	c.stunMessage(stunMessageOfType(0x0105, nil), 100)
+	c.stunMessage(stunMessageOfType(0x0105, nil), 200)
+	c.stunMessage(stunMessageOfType(0x0110, nil), 300)
+	// A datagram too short to carry a message type at all is its own reading
+	// and must not be forged into 0x0000.
+	c.stunMessage([]byte{0x00}, 400)
+	s := c.snapshot(400, true)
+	if s.STUNTypes[CensusStunOther] != 4 {
+		t.Fatalf("the other count is wrong: %v", s.STUNTypes)
+	}
+	if s.STUNOtherTypes["0x0105"] != 2 || s.STUNOtherTypes["0x0110"] != 1 {
+		t.Fatalf("the raw types did not survive: %v", s.STUNOtherTypes)
+	}
+	if s.STUNOtherTypes["untyped"] != 1 {
+		t.Fatalf("a datagram with no message type was not reported as such: %v", s.STUNOtherTypes)
+	}
+	if s.STUNOtherTypes["0x0000"] != 0 {
+		t.Fatalf("a type was fabricated for an untyped datagram: %v", s.STUNOtherTypes)
+	}
+	if !strings.Contains(s.Summary(), "0x0105=2") {
+		t.Fatalf("the summary does not name the unexpected type: %s", s.Summary())
+	}
+}
+
+// TestTheRefreshTransactionIdIsReportedBesideTheInitialOne. SendCurrent
+// replays the initial allocate packet verbatim, transaction id included. This
+// change does not alter that; it reports both ids so a reader can see at a
+// glance whether they are the same.
+func TestTheRefreshTransactionIdIsReportedBesideTheInitialOne(t *testing.T) {
+	reused := newMediaCensus("c1", true)
+	reused.allocateInitialTx("0a0b0c")
+	reused.allocateRefreshSent("0a0b0c")
+	reused.allocateRefreshSent("0a0b0c")
+	s := reused.snapshot(2000, false)
+	if s.AllocateTxInitial != "0a0b0c" || s.AllocateTxRefresh != "0a0b0c" {
+		t.Fatalf("the transaction ids are wrong: %+v", s)
+	}
+	if s.AllocateRefreshes != 2 || s.AllocateRefreshTxReused != 2 {
+		t.Fatalf("refreshes = %d, reused = %d, want 2 and 2", s.AllocateRefreshes, s.AllocateRefreshTxReused)
+	}
+	if !s.RefreshReusesInitialTransactionID() {
+		t.Fatal("a replayed transaction id did not read as reuse")
+	}
+	if !strings.Contains(s.Summary(), "tx_reused=true") {
+		t.Fatalf("the summary does not answer the question: %s", s.Summary())
+	}
+
+	fresh := newMediaCensus("c1", true)
+	fresh.allocateInitialTx("0a0b0c")
+	fresh.allocateRefreshSent("deadbe")
+	f := fresh.snapshot(1000, false)
+	if f.AllocateRefreshTxReused != 0 || f.RefreshReusesInitialTransactionID() {
+		t.Fatalf("a fresh transaction id read as reuse: %+v", f)
+	}
+	if f.AllocateRefreshes != 1 {
+		t.Fatalf("refreshes = %d, want 1", f.AllocateRefreshes)
+	}
+	// A call whose refresh we never observed reports none rather than an
+	// empty string, which in a greppable line reads as a parsing accident.
+	never := newMediaCensus("c1", true).snapshot(0, true)
+	if !strings.Contains(never.Summary(), "tx_refresh=none") {
+		t.Fatalf("an unobserved refresh is unreadable: %s", never.Summary())
+	}
+}
+
+// TestTheStunCensusLeaksNothing is the same hard line as its sibling, over
+// the patch-5 fields: the snapshot is a map copy handed to the observer while
+// the receive goroutine keeps counting, and it carries transaction ids.
+func TestTheStunCensusLeaksNothing(t *testing.T) {
+	c := newMediaCensus("call-abc", true)
+	c.allocateInitialTx("0a0b0c0d0e0f101112131415")
+	c.allocateRefreshSent("0a0b0c0d0e0f101112131415")
+	c.stunMessage(stunMessageOfType(stun.MsgAllocateError, stunErrorCodeAttr(437)), 1012)
+	c.stunMessage(stunMessageOfType(0x0105, nil), 1500)
+	s := c.snapshot(2000, true)
+
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// The deep copy is what makes the snapshot safe to hand out at all: the
+	// observer must not hold the collector's live maps.
+	s.STUNTypes[CensusStunPong] = 99
+	if after := c.snapshot(2000, true); after.STUNTypes[CensusStunPong] != 0 {
+		t.Fatalf("the observer's map is the collector's own: %v", after.STUNTypes)
+	}
+
+	// Over the Summary and over every STRING VALUE in the JSON, not over the
+	// key names: the allowlist in the sibling test already refuses an
+	// undeclared key, and a value-shaped scan over keys only collides with
+	// the counters' own honest names (unknown_payload is a count).
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &probe); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	scanned := []string{s.Summary()}
+	for _, raw := range probe {
+		var str string
+		if json.Unmarshal(raw, &str) == nil {
+			scanned = append(scanned, str)
+		}
+		var counters map[string]uint64
+		if json.Unmarshal(raw, &counters) == nil {
+			// The MAP KEYS too: stun_other_types and allocate_errors are
+			// keyed on data off the wire, which is exactly where a leak would
+			// arrive without anybody declaring a field for it.
+			for key := range counters {
+				scanned = append(scanned, key)
+			}
+		}
+	}
+	// "token" and "key" are in the sibling's list and stay in it: the relay
+	// TOKEN is key material and must never appear here, under any name.
+	for _, forbidden := range []string{"secret", "pcm", "payload", "rms", "sample", "token", "plaintext", "relay_key", "call_key"} {
+		for _, text := range scanned {
+			if strings.Contains(strings.ToLower(text), forbidden) {
+				t.Fatalf("the emitted census contains %q: %s", forbidden, text)
+			}
+		}
+	}
+	// The premise: the scan is looking at a populated snapshot.
+	if !strings.Contains(s.Summary(), "allocate_error=1") ||
+		!strings.Contains(s.Summary(), "first_allocate_error=[code=437") {
+		t.Fatalf("the summary does not carry what it is read for: %s", s.Summary())
 	}
 }

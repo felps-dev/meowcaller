@@ -41,9 +41,13 @@ package meowcaller
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/purpshell/meowcaller/stun"
 )
 
 // mediaCensusInterval is how often a LIVE call publishes a snapshot.
@@ -106,6 +110,81 @@ var censusFailKinds = []string{
 	CensusFailNoContext, CensusFailUnparsableRTP, CensusFailTooShort,
 	CensusFailMalformedHeader, CensusFailAuthTag, CensusFailDecrypt,
 	CensusFailDecodeEmpty,
+}
+
+// The STUN message classes this census distinguishes, one per answer the
+// relay can give us. Patch 5 exists because none of them was ever told apart:
+// the receive loop tested only for MsgBindingRequest and let every other STUN
+// type fall through to `continue`, so an allocate ERROR and an allocate
+// SUCCESS produced exactly the same observable — none.
+//
+// The classifier is built out of the fork's four already-present response
+// parsers (IsAllocateError, IsWhatsappPong, IsAllocateOrBindingSuccess,
+// ParseStunErrorCode), which had no non-test caller at all. A fifth parser
+// written beside them could disagree with the behaviour it describes; these
+// cannot.
+const (
+	// CensusStunAllocateSuccess: the relay accepted an allocate. The INITIAL
+	// one succeeding and the 1 Hz refreshes then not is the live hypothesis.
+	CensusStunAllocateSuccess = "allocate_success"
+
+	// CensusStunAllocateError: the relay REFUSED an allocate. THE kind to
+	// watch, and the one with an error code beside it.
+	CensusStunAllocateError = "allocate_error"
+
+	// CensusStunBindingSuccess is kept apart from allocate_success even
+	// though IsAllocateOrBindingSuccess conflates them: a binding success is
+	// the relay acking a binding exchange and says nothing about whether our
+	// allocation still exists. Folding the two would let a healthy ack read
+	// as an accepted allocate, which is the one mistake this classifier must
+	// not make.
+	CensusStunBindingSuccess = "binding_success"
+
+	// CensusStunBindingRequest: the relay asking US for consent freshness.
+	// Already answered (SendBindingSuccess) and already counted
+	// (STUNBindingsAnswered); counted here too so the type breakdown sums.
+	CensusStunBindingRequest = "binding_request"
+
+	// CensusStunPong: the answer to our 1 Hz consent ping. Arriving at ~1/s
+	// with nothing else is a socket kept alive around a dead bridge.
+	CensusStunPong = "pong"
+
+	// CensusStunOther: a STUN type none of the above matched. Its raw 16-bit
+	// message type is reported in STUNOtherTypes, so an unexpected type names
+	// itself instead of hiding in a catch-all.
+	CensusStunOther = "other"
+)
+
+// censusStunKinds is every STUN class, in the order a reader wants them: the
+// allocate answers first, because they are the question.
+var censusStunKinds = []string{
+	CensusStunAllocateSuccess, CensusStunAllocateError,
+	CensusStunBindingSuccess, CensusStunBindingRequest,
+	CensusStunPong, CensusStunOther,
+}
+
+// CensusAllocateError is the FIRST allocate refusal of a call.
+//
+// The elapsed time is the field that carries the diagnosis: a refusal at
+// ~1000 ms says the first 1 Hz refresh was rejected while the initial
+// allocate was accepted, which is exactly the shape of "five packets bridged
+// and then nothing for the next three minutes". A refusal at 0 ms would say
+// something quite different — that the bridge never formed at all.
+type CensusAllocateError struct {
+	// Code is the STUN error code (class*100+number), 0 when the response
+	// carried no ERROR-CODE attribute. CodeFound says which of the two it is,
+	// because 0 is not a code and must not read as one.
+	Code      uint16 `json:"code"`
+	CodeFound bool   `json:"code_found"`
+	ElapsedMS int64  `json:"elapsed_ms"`
+}
+
+func (e CensusAllocateError) String() string {
+	code := "absent"
+	if e.CodeFound {
+		code = strconv.FormatUint(uint64(e.Code), 10)
+	}
+	return fmt.Sprintf("code=%s at=%dms", code, e.ElapsedMS)
 }
 
 // CensusPacket is the sequence/ROC pair of one successfully decrypted packet.
@@ -204,6 +283,46 @@ type MediaCensus struct {
 	// STUNBindingsAnswered is binding requests we answered. A relay that
 	// stops bridging while still asking is the consent-path answer.
 	STUNBindingsAnswered uint64 `json:"stun_bindings_answered"`
+
+	// STUNTypes is the inbound STUN breakdown, keyed by the CensusStun*
+	// classes. It sums to STUN. Absent rather than empty, like Failures.
+	STUNTypes map[string]uint64 `json:"stun_types,omitempty"`
+
+	// STUNOtherTypes is the raw 16-bit message type, hex, of every datagram
+	// that landed in CensusStunOther, so a type we did not anticipate names
+	// itself rather than disappearing into a catch-all.
+	STUNOtherTypes map[string]uint64 `json:"stun_other_types,omitempty"`
+
+	// AllocateErrors counts allocate refusals BY STUN ERROR CODE, keyed by
+	// the decimal code ("437") or "none" for a refusal that carried no
+	// ERROR-CODE attribute. The code is what aims the fix: this change only
+	// measures.
+	AllocateErrors map[string]uint64 `json:"allocate_errors,omitempty"`
+
+	// FirstAllocateError is the first refusal and WHEN it arrived. Nil means
+	// no allocate was ever refused, which is itself a reading.
+	FirstAllocateError *CensusAllocateError `json:"first_allocate_error,omitempty"`
+
+	// The allocate transaction ids, hex. SendCurrent replays the INITIAL
+	// allocate packet — transaction id included — once a second, and a relay
+	// may read a repeated transaction id as a retransmission or as a
+	// conflicting re-allocation. Nothing here CHANGES that; the two ids are
+	// reported side by side so a reader can see at a glance whether they are
+	// the same.
+	AllocateTxInitial string `json:"allocate_tx_initial,omitempty"`
+	AllocateTxRefresh string `json:"allocate_tx_refresh,omitempty"`
+
+	// AllocateRefreshes is refreshes sent; AllocateRefreshTxReused is how
+	// many of them carried the initial transaction id. Zero refreshes with a
+	// live call would be its own finding, so both are published even at zero.
+	AllocateRefreshes       uint64 `json:"allocate_refreshes"`
+	AllocateRefreshTxReused uint64 `json:"allocate_refresh_tx_reused"`
+}
+
+// RefreshReusesInitialTransactionID is the at-a-glance form of the two ids: a
+// refresh has been sent and it carried the initial transaction id.
+func (c MediaCensus) RefreshReusesInitialTransactionID() bool {
+	return c.AllocateRefreshTxReused > 0
 }
 
 // Summary is the one-line human form. It is the line an operator greps and it
@@ -234,7 +353,31 @@ func (c MediaCensus) Summary() string {
 	if len(fails) > 0 {
 		fmt.Fprintf(&b, " failures=[%s]", strings.Join(fails, " "))
 	}
+	if types := renderCensusCounters(c.STUNTypes, censusStunKinds); types != "" {
+		fmt.Fprintf(&b, " stun_types=[%s]", types)
+	}
+	if other := renderCensusCounters(c.STUNOtherTypes, nil); other != "" {
+		fmt.Fprintf(&b, " stun_other_types=[%s]", other)
+	}
+	if errs := renderCensusCounters(c.AllocateErrors, nil); errs != "" {
+		fmt.Fprintf(&b, " allocate_errors=[%s]", errs)
+	}
+	if c.FirstAllocateError != nil {
+		fmt.Fprintf(&b, " first_allocate_error=[%s]", c.FirstAllocateError.String())
+	}
+	fmt.Fprintf(&b, " allocate_refreshes=%d tx_initial=%s tx_refresh=%s tx_reused=%t",
+		c.AllocateRefreshes, censusTxOrNone(c.AllocateTxInitial),
+		censusTxOrNone(c.AllocateTxRefresh), c.RefreshReusesInitialTransactionID())
 	return b.String()
+}
+
+// censusTxOrNone renders a transaction id, or "none" for one we never saw —
+// an empty string in a greppable line reads as a parsing accident.
+func censusTxOrNone(txHex string) string {
+	if txHex == "" {
+		return "none"
+	}
+	return txHex
 }
 
 // mediaCensus is the collector. One per call's media loop.
@@ -253,12 +396,21 @@ type mediaCensus struct {
 	lastSeq  uint16
 	haveLast bool
 	failures map[string]uint64
+	// The three STUN-side maps, held beside failures and for the same
+	// reason: they are handed out by value on every snapshot and the receive
+	// goroutine keeps writing to these.
+	stunTypes      map[string]uint64
+	stunOtherTypes map[string]uint64
+	allocateErrors map[string]uint64
 }
 
 func newMediaCensus(callID string, inbound bool) *mediaCensus {
 	return &mediaCensus{
-		snap:     MediaCensus{CallID: callID, Inbound: inbound},
-		failures: map[string]uint64{},
+		snap:           MediaCensus{CallID: callID, Inbound: inbound},
+		failures:       map[string]uint64{},
+		stunTypes:      map[string]uint64{},
+		stunOtherTypes: map[string]uint64{},
+		allocateErrors: map[string]uint64{},
 	}
 }
 
@@ -374,6 +526,92 @@ func (c *mediaCensus) stunBindingAnswered() {
 	c.mu.Unlock()
 }
 
+// classifyCensusStun names one inbound STUN datagram, using the fork's own
+// response parsers rather than a parser written beside them.
+//
+// Order matters only where the parsers overlap: IsAllocateOrBindingSuccess
+// answers true for two distinct types, so the message type discriminates
+// after it, and the binding REQUEST is matched explicitly rather than left to
+// the default — a request is the one STUN type this stack acts on, and a
+// classifier that let it fall into "other" would hide the consent path.
+func classifyCensusStun(data []byte) string {
+	mt, haveType := stun.StunMessageType(data)
+	switch {
+	case stun.IsAllocateError(data):
+		return CensusStunAllocateError
+	case stun.IsWhatsappPong(data, nil):
+		return CensusStunPong
+	case stun.IsAllocateOrBindingSuccess(data):
+		if haveType && mt == stun.MsgBindingSuccess {
+			return CensusStunBindingSuccess
+		}
+		return CensusStunAllocateSuccess
+	case haveType && mt == stun.MsgBindingRequest:
+		return CensusStunBindingRequest
+	default:
+		return CensusStunOther
+	}
+}
+
+// stunMessage classifies one inbound STUN datagram and, when it is an
+// allocate refusal, records its error code.
+//
+// It returns firstError true for the FIRST refusal of the call only, so the
+// caller can say so loudly once rather than once per second for the rest of a
+// three-minute call.
+func (c *mediaCensus) stunMessage(data []byte, elapsedMS int64) (kind string, code uint16, codeFound bool, firstError bool) {
+	kind = classifyCensusStun(data)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stunTypes[kind]++
+	if kind == CensusStunOther {
+		// The raw type, so an unexpected answer names itself. A datagram too
+		// short to carry a type is its own reading and gets its own key
+		// rather than a fabricated 0x0000.
+		if mt, ok := stun.StunMessageType(data); ok {
+			c.stunOtherTypes[fmt.Sprintf("0x%04x", mt)]++
+		} else {
+			c.stunOtherTypes["untyped"]++
+		}
+	}
+	if kind != CensusStunAllocateError {
+		return kind, 0, false, false
+	}
+	code, codeFound = stun.ParseStunErrorCode(data)
+	key := "none"
+	if codeFound {
+		key = strconv.FormatUint(uint64(code), 10)
+	}
+	c.allocateErrors[key]++
+	if c.snap.FirstAllocateError == nil {
+		c.snap.FirstAllocateError = &CensusAllocateError{
+			Code: code, CodeFound: codeFound, ElapsedMS: elapsedMS,
+		}
+		firstError = true
+	}
+	return kind, code, codeFound, firstError
+}
+
+// allocateInitialTx records the transaction id of the allocate sent at
+// connect, which every later refresh is compared against.
+func (c *mediaCensus) allocateInitialTx(txHex string) {
+	c.mu.Lock()
+	c.snap.AllocateTxInitial = txHex
+	c.mu.Unlock()
+}
+
+// allocateRefreshSent records one 1 Hz refresh and whether it reused the
+// initial transaction id. Observation only: the send already happened.
+func (c *mediaCensus) allocateRefreshSent(txHex string) {
+	c.mu.Lock()
+	c.snap.AllocateRefreshes++
+	c.snap.AllocateTxRefresh = txHex
+	if txHex != "" && txHex == c.snap.AllocateTxInitial {
+		c.snap.AllocateRefreshTxReused++
+	}
+	c.mu.Unlock()
+}
+
 // snapshot copies the counters. elapsedMS and final are the caller's, because
 // the collector does not own a clock and does not know which emission is the
 // last one.
@@ -393,6 +631,13 @@ func (c *mediaCensus) snapshot(elapsedMS int64, final bool) MediaCensus {
 			out.Failures[k] = v
 		}
 	}
+	out.STUNTypes = copyCensusCounters(c.stunTypes)
+	out.STUNOtherTypes = copyCensusCounters(c.stunOtherTypes)
+	out.AllocateErrors = copyCensusCounters(c.allocateErrors)
+	if c.snap.FirstAllocateError != nil {
+		firstErr := *c.snap.FirstAllocateError
+		out.FirstAllocateError = &firstErr
+	}
 	if c.snap.First != nil {
 		first := *c.snap.First
 		out.First = &first
@@ -402,6 +647,47 @@ func (c *mediaCensus) snapshot(elapsedMS int64, final bool) MediaCensus {
 		out.Last = &last
 	}
 	return out
+}
+
+// copyCensusCounters deep-copies one counter map, nil for empty so an absent
+// breakdown reads as "none of this happened" rather than as an empty object.
+func copyCensusCounters(src map[string]uint64) map[string]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+// renderCensusCounters renders a counter map as "k=v k=v", ordered: the named
+// keys in the given order first, then anything else sorted, so two snapshots
+// of one call line up column for column.
+func renderCensusCounters(counts map[string]uint64, order []string) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	var parts []string
+	named := map[string]bool{}
+	for _, key := range order {
+		named[key] = true
+		if n := counts[key]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", key, n))
+		}
+	}
+	var rest []string
+	for key := range counts {
+		if !named[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // report emits one snapshot through the library's logger, the diag recorder
@@ -420,12 +706,24 @@ func (e *engine) reportMediaCensus(c MediaCensus) {
 		Interface("failures", c.Failures).
 		Interface("first", c.First).
 		Interface("last", c.Last).
+		Interface("stun_types", c.STUNTypes).
+		Interface("stun_other_types", c.STUNOtherTypes).
+		Interface("allocate_errors", c.AllocateErrors).
+		Interface("first_allocate_error", c.FirstAllocateError).
+		Uint64("allocate_refreshes", c.AllocateRefreshes).
+		Str("allocate_tx_initial", c.AllocateTxInitial).
+		Str("allocate_tx_refresh", c.AllocateTxRefresh).
+		Bool("allocate_refresh_reuses_tx", c.RefreshReusesInitialTransactionID()).
 		Msg("media census (temporary diagnostic, upstream issue #40)")
 	e.c.diag.Emit("relay", map[string]any{
 		"event": "media_census", "call_id": c.CallID, "final": c.Final,
 		"elapsed_ms": c.ElapsedMS, "datagrams": c.Datagrams, "rtp": c.RTP,
 		"audio": c.Audio, "unprotect_successes": c.UnprotectSuccesses,
 		"frames_decoded": c.FramesDecoded, "failures": c.Failures,
+		"stun_types": c.STUNTypes, "stun_other_types": c.STUNOtherTypes,
+		"allocate_errors": c.AllocateErrors, "first_allocate_error": c.FirstAllocateError,
+		"allocate_refreshes":  c.AllocateRefreshes,
+		"allocate_tx_initial": c.AllocateTxInitial, "allocate_tx_refresh": c.AllocateTxRefresh,
 	})
 	if fn := e.c.mediaCensusObserver; fn != nil {
 		fn(c)
