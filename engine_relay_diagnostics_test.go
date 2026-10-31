@@ -13,13 +13,26 @@ func ep(name string, fna bool, auth uint32, ip string, port uint16) relayEndpoin
 	}
 }
 
+// epToken is ep with the token_id that the #40 fallback now discriminates on.
+func epToken(name string, token uint32, ip string, port uint16) relayEndpoint {
+	e := ep(name, false, 0, ip, port)
+	e.tokenID = token
+	return e
+}
+
 // TestTheReportNamesTheBranchThatChose pins the report against every branch of
 // selectMediaRelayEndpoint, including the #40 case: an inbound call with no
-// is_fna endpoint, which falls through to the outbound preference.
+// is_fna endpoint, which now resolves by token_id rather than by offer order.
 func TestTheReportNamesTheBranchThatChose(t *testing.T) {
 	fna := ep("gru1c01", true, 0, "1.1.1.1", 3478)
 	authed := ep("gru2c02", false, 7, "2.2.2.2", 3479)
 	plain := ep("poa1c01", false, 0, "3.3.3.3", 3480)
+	// The production shape of the 06:33 call: two non-FNA endpoints, both
+	// auth_token_id=0, differing only in token_id. gig4c02 came FIRST and was
+	// what the old fallback chose.
+	tok1 := epToken("gig4c02", 1, "4.4.4.4", 3478)
+	tok2 := epToken("mia1c01", 2, "5.5.5.5", 3478)
+	tok0 := epToken("gru2c01", 0, "6.6.6.6", 3478)
 
 	cases := []struct {
 		name    string
@@ -33,7 +46,14 @@ func TestTheReportNamesTheBranchThatChose(t *testing.T) {
 		{"inbound prefers fna", &relayData{endpoints: []relayEndpoint{authed, fna}}, true, RelayBranchInboundFNA, "gru1c01", 1, 1},
 		{"inbound with no fna falls through", &relayData{endpoints: []relayEndpoint{authed, plain}}, true, RelayBranchOutboundAuthed, "gru2c02", 0, 0},
 		{"outbound ignores fna", &relayData{endpoints: []relayEndpoint{fna, authed}}, false, RelayBranchOutboundAuthed, "gru2c02", 1, 1},
-		{"unauthed non-fna", &relayData{endpoints: []relayEndpoint{plain}}, true, RelayBranchNonFNA, "poa1c01", 0, 0},
+		{"unauthed non-fna, outbound", &relayData{endpoints: []relayEndpoint{plain}}, false, RelayBranchNonFNA, "poa1c01", 0, 0},
+		// The #40 guess, on the offer production actually sent.
+		{"inbound with no fna prefers token_id 0", &relayData{endpoints: []relayEndpoint{tok1, tok0}}, true, RelayBranchInboundNoFNAToken0, "gru2c01", 1, 0},
+		{"inbound with no fna and no token_id 0 takes the LAST", &relayData{endpoints: []relayEndpoint{tok1, tok2}}, true, RelayBranchInboundNoFNALast, "mia1c01", 1, 0},
+		// The scoping, both ways: an inbound call that HAS an authed endpoint
+		// is untouched by the guess, and an OUTBOUND call on the exact
+		// production offer still takes the first in offer order.
+		{"outbound with no fna is unchanged", &relayData{endpoints: []relayEndpoint{tok1, tok0}}, false, RelayBranchNonFNA, "gig4c02", 0, 0},
 		{"only fna, outbound", &relayData{endpoints: []relayEndpoint{fna}}, false, RelayBranchFirst, "gru1c01", 0, 1},
 		{"no endpoints", &relayData{}, true, RelayBranchNone, "", -1, 0},
 	}

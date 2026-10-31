@@ -1680,6 +1680,41 @@ func selectMediaRelayEndpoint(rd *relayData, inbound bool) (*relayEndpoint, stri
 			return e, RelayBranchOutboundAuthed
 		}
 	}
+	// AN EMPIRICAL GUESS, on ONE observation, with no specification behind it
+	// (upstream issue #40, TEMPORARY — see engine_relay_diagnostics.go).
+	//
+	// An inbound call that reaches here has no is_fna endpoint to allocate on,
+	// which is #40's precondition, and no non-FNA entry with an auth token
+	// either. That is exactly the case observed in production: a silent
+	// inbound call whose offer carried two non-FNA endpoints, both with
+	// auth_token_id=0, differing ONLY in token_id (1 and 0). The old fallback
+	// took the first in offer order, which was token_id=1, and the call
+	// decoded 3 inbound frames against 122 outbound.
+	//
+	// So the guess is that token_id=0 is the entry the caller's uplink is
+	// bridged on when the offer marks no FNA relay. We have no document, no
+	// second sample and no way to test it from here; the ONLY reason to
+	// prefer it is that it is the one thing the two candidates disagreed
+	// about. If the next live call is still silent, the discriminator is not
+	// in this list at all and the next step is capturing the raw <relay>
+	// node, not guessing at another attribute of it.
+	//
+	// Scoped to the inbound-with-no-FNA case deliberately: outbound calls and
+	// inbound calls that DO carry an FNA or an authed endpoint keep the
+	// pinned selection byte for byte, so a wrong guess can only affect the
+	// calls that were already failing.
+	if inbound {
+		for i := range rd.endpoints {
+			if e := &rd.endpoints[i]; !e.isFNA && e.tokenID == 0 {
+				return e, RelayBranchInboundNoFNAToken0
+			}
+		}
+		for i := len(rd.endpoints) - 1; i >= 0; i-- {
+			if e := &rd.endpoints[i]; !e.isFNA {
+				return e, RelayBranchInboundNoFNALast
+			}
+		}
+	}
 	for i := range rd.endpoints {
 		if e := &rd.endpoints[i]; !e.isFNA {
 			return e, RelayBranchNonFNA

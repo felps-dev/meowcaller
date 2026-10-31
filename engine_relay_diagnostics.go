@@ -31,6 +31,18 @@ const (
 	// RelayBranchOutboundAuthed: a non-FNA endpoint with auth_token_id≠0.
 	RelayBranchOutboundAuthed = "outbound_authed"
 
+	// RelayBranchInboundNoFNAToken0: an inbound call with no is_fna endpoint
+	// and no authed one, resolved to the non-FNA entry whose token_id is 0.
+	// An EMPIRICAL GUESS from one production call — see the comment at the
+	// branch itself in engine.go; it is named so a log line says which guess
+	// ran.
+	RelayBranchInboundNoFNAToken0 = "inbound_no_fna_token0"
+
+	// RelayBranchInboundNoFNALast: the same case with no token_id==0 entry;
+	// the LAST non-FNA entry in offer order, which is the other half of the
+	// same guess (the old behaviour took the first).
+	RelayBranchInboundNoFNALast = "inbound_no_fna_last"
+
 	// RelayBranchNonFNA: a non-FNA endpoint with auth_token_id==0.
 	RelayBranchNonFNA = "non_fna"
 
