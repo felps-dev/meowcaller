@@ -1680,35 +1680,36 @@ func selectMediaRelayEndpoint(rd *relayData, inbound bool) (*relayEndpoint, stri
 			return e, RelayBranchOutboundAuthed
 		}
 	}
-	// AN EMPIRICAL GUESS, on ONE observation, with no specification behind it
+	// AN EMPIRICAL GUESS, on TWO observations, with no specification behind it
 	// (upstream issue #40, TEMPORARY — see engine_relay_diagnostics.go).
 	//
 	// An inbound call that reaches here has no is_fna endpoint to allocate on,
 	// which is #40's precondition, and no non-FNA entry with an auth token
-	// either. That is exactly the case observed in production: a silent
-	// inbound call whose offer carried two non-FNA endpoints, both with
-	// auth_token_id=0, differing ONLY in token_id (1 and 0). The old fallback
-	// took the first in offer order, which was token_id=1, and the call
-	// decoded 3 inbound frames against 122 outbound.
+	// either. Both production calls observed so far had exactly that shape: two
+	// non-FNA endpoints, both auth_token_id=0, index 0 a 'gig' relay (Rio) and
+	// index 1 a 'gru' one (São Paulo). Their token_ids were 1/0 on the first
+	// call and 0/1 on the second — token_id is PER-CALL and carries no
+	// information about the relay, so a rule derived from it selected the SAME
+	// endpoint (index 0) both times, by position once and by token_id once.
+	// Both calls were silent. Nothing token-derived may appear here again.
 	//
-	// So the guess is that token_id=0 is the entry the caller's uplink is
-	// bridged on when the offer marks no FNA relay. We have no document, no
-	// second sample and no way to test it from here; the ONLY reason to
-	// prefer it is that it is the one thing the two candidates disagreed
-	// about. If the next live call is still silent, the discriminator is not
-	// in this list at all and the next step is capturing the raw <relay>
-	// node, not guessing at another attribute of it.
+	// What is stable across the two offers is the position: index 0 was the
+	// 'gig' (Rio) entry both times, which is the relay nearest the CALLER (a
+	// DDD 21 number), and it is the one we have always bound. The guess is
+	// therefore the LAST non-FNA entry — the one we have never bound — on the
+	// reasoning that the caller's uplink may be landing on the other relay
+	// when the offer marks no FNA one. There is no
+	// document behind that and no way to test it from here. If the next live
+	// call is ALSO silent, the discriminator is not in this endpoint list at
+	// all and the next step is capturing the raw <relay> node from the offer,
+	// not guessing at another of its attributes. The mechanism is NOT
+	// understood.
 	//
 	// Scoped to the inbound-with-no-FNA case deliberately: outbound calls and
 	// inbound calls that DO carry an FNA or an authed endpoint keep the
 	// pinned selection byte for byte, so a wrong guess can only affect the
 	// calls that were already failing.
 	if inbound {
-		for i := range rd.endpoints {
-			if e := &rd.endpoints[i]; !e.isFNA && e.tokenID == 0 {
-				return e, RelayBranchInboundNoFNAToken0
-			}
-		}
 		for i := len(rd.endpoints) - 1; i >= 0; i-- {
 			if e := &rd.endpoints[i]; !e.isFNA {
 				return e, RelayBranchInboundNoFNALast
