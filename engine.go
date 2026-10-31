@@ -1659,25 +1659,34 @@ func parseRelayData(node *waBinary.Node) *relayData {
 // FNA-marked relay, so we must allocate on that same relay or the relay never bridges the
 // peer's media (the callee connects but hears nothing).
 func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
+	ep, _ := selectMediaRelayEndpoint(rd, inbound)
+	return ep
+}
+
+// selectMediaRelayEndpoint is getMediaRelayEndpoint plus the NAME of the branch
+// that decided, so the choice can be reported without a second copy of the
+// heuristic (see engine_relay_diagnostics.go, temporary, upstream issue #40).
+// The branches and their order are unchanged.
+func selectMediaRelayEndpoint(rd *relayData, inbound bool) (*relayEndpoint, string) {
 	if inbound {
 		for i := range rd.endpoints {
 			if e := &rd.endpoints[i]; e.isFNA {
-				return e
+				return e, RelayBranchInboundFNA
 			}
 		}
 	}
 	for i := range rd.endpoints {
 		if e := &rd.endpoints[i]; !e.isFNA && e.authTokenID != 0 {
-			return e
+			return e, RelayBranchOutboundAuthed
 		}
 	}
 	for i := range rd.endpoints {
 		if e := &rd.endpoints[i]; !e.isFNA {
-			return e
+			return e, RelayBranchNonFNA
 		}
 	}
 	if len(rd.endpoints) > 0 {
-		return &rd.endpoints[0]
+		return &rd.endpoints[0], RelayBranchFirst
 	}
-	return nil
+	return nil, RelayBranchNone
 }

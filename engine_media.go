@@ -220,6 +220,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
+	// TEMPORARY (upstream issue #40): report the relay endpoint selection
+	// once per call, here, because this is the last point at which rd is
+	// final and the transport has not been dialled yet.
+	e.reportRelaySelection(callID, rd, inbound)
 	ch, allocate, err := e.connectAndAllocate(ctx, rd, streamSsrcs, inbound)
 	if err != nil {
 		return err

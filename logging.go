@@ -16,6 +16,10 @@ type config struct {
 	diag *diag.Recorder
 
 	mediaPacketConn func(relayAddr *net.UDPAddr) (net.PacketConn, error)
+
+	// relayEndpointObserver is the temporary issue-#40 diagnostic hook. See
+	// WithRelayEndpointObserver and engine_relay_diagnostics.go.
+	relayEndpointObserver func(RelayEndpointSelection)
 }
 
 func resolveConfig(opts []Option) config {
@@ -40,6 +44,23 @@ func WithLogger(l zerolog.Logger) Option {
 // diag emit is a no-op at zero cost.
 func WithDiagnostics(rec *diag.Recorder) Option {
 	return func(c *config) { c.diag = rec }
+}
+
+// WithRelayEndpointObserver installs a once-per-call diagnostic callback that
+// reports the offer's parsed relay endpoint list and which entry this call's
+// media was allocated on.
+//
+// TEMPORARY: it exists to observe upstream issue purpshell/meowcaller#40 ("no
+// inbound audio when the offer carries no is_fna endpoint") from an integrator
+// that cannot see the unexported selection, and goes away with the issue. The
+// report carries addresses, ports, token IDs and the is_fna flag only — no key
+// material, no call key, no media — because it is meant to be readable in
+// production logs.
+//
+// fn runs on the media goroutine, before the relay transport is dialled. It
+// must not block.
+func WithRelayEndpointObserver(fn func(RelayEndpointSelection)) Option {
+	return func(c *config) { c.relayEndpointObserver = fn }
 }
 
 // WithMediaPacketConn makes every relay media connection run over the datagram
