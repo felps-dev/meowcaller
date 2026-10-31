@@ -332,21 +332,35 @@ func (p *MediaPipeline) SenderStats() rtp.RtcpSenderStats {
 // decrypts the payload, guessing the ROC from the recv tracker. ok=false on a
 // malformed or unauthenticated packet.
 func (p *MediaPipeline) UnprotectAudio(packet []byte) (rtp.RtpHeader, []byte, bool) {
+	header, payload, _, _, ok := p.unprotectAudioCensus(packet)
+	return header, payload, ok
+}
+
+// unprotectAudioCensus is UnprotectAudio with the TEMPORARY #40 census's two
+// extra facts: WHY it refused the packet, and the ROC it used.
+//
+// It is the same function rather than a copy — UnprotectAudio delegates to it
+// — because the thing being measured is this code's own behaviour, and a
+// second implementation that reported on the first would be a second opinion
+// about the one thing we are trying to observe. The returned kind is "" on
+// success. Remove the kind and the roc, and fold this back into
+// UnprotectAudio, once #40 is closed.
+func (p *MediaPipeline) unprotectAudioCensus(packet []byte) (rtp.RtpHeader, []byte, string, uint32, bool) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/session.rs#L155-L175
 	if len(packet) < 12+p.warpMITagLen {
 		p.log.Debug().Int("packet_bytes", len(packet)).Int("min_bytes", 12+p.warpMITagLen).Msg("unprotect: packet too short")
-		return rtp.RtpHeader{}, nil, false
+		return rtp.RtpHeader{}, nil, CensusFailTooShort, 0, false
 	}
 	withoutTag := packet[:len(packet)-p.warpMITagLen]
 	header, ok := rtp.ParseRtpHeader(withoutTag)
 	if !ok {
 		p.log.Debug().Int("packet_bytes", len(packet)).Msg("unprotect: malformed RTP header")
-		return rtp.RtpHeader{}, nil, false
+		return rtp.RtpHeader{}, nil, CensusFailMalformedHeader, 0, false
 	}
 	headerLen, ok := rtp.RtpHeaderByteLength(withoutTag)
 	if !ok || len(withoutTag) <= headerLen {
 		p.log.Debug().Uint32("ssrc", header.Ssrc).Int("header_bytes", headerLen).Msg("unprotect: header length invalid or no payload")
-		return rtp.RtpHeader{}, nil, false
+		return rtp.RtpHeader{}, nil, CensusFailMalformedHeader, 0, false
 	}
 	p.recvMu.Lock()
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/2f001b5a3d6374cc5cf7177792c2a81f87a54080/wacore/src/voip/session.rs#L239-L250
@@ -355,16 +369,16 @@ func (p *MediaPipeline) UnprotectAudio(packet []byte) (rtp.RtpHeader, []byte, bo
 	if !srtp.VerifyWarpMITag(p.recvKeys.AuthKey[:], withoutTag, roc, p.warpMITagLen, tag, p.log) {
 		p.recvMu.Unlock()
 		p.log.Debug().Uint32("ssrc", header.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("roc", roc).Msg("unprotect: WARP MI authentication failed")
-		return rtp.RtpHeader{}, nil, false
+		return rtp.RtpHeader{}, nil, CensusFailAuthTag, roc, false
 	}
 	p.recvRoc.CommitRoc(roc, header.SequenceNumber)
 	plain, err := srtp.CryptPayload(&p.recvKeys, header.Ssrc, header.SequenceNumber, roc, withoutTag[headerLen:])
 	p.recvMu.Unlock()
 	if err != nil {
 		p.log.Debug().Err(err).Uint32("ssrc", header.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("roc", roc).Msg("unprotect: SRTP decrypt failed")
-		return rtp.RtpHeader{}, nil, false
+		return rtp.RtpHeader{}, nil, CensusFailDecrypt, roc, false
 	}
 	p.log.Trace().Uint32("ssrc", header.Ssrc).Uint16("seq", header.SequenceNumber).Uint32("roc", roc).
 		Int("plain_bytes", len(plain)).Msg("unprotected audio frame")
-	return header, plain, true
+	return header, plain, "", roc, true
 }

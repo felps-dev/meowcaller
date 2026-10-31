@@ -846,28 +846,38 @@ func (r *participantReceiveRegistry) ActiveVideoSSRCs() []uint32 {
 }
 
 func (r *participantReceiveRegistry) DecodeAudio(packet []byte) (decodedParticipantAudio, bool) {
+	audio, _, _, ok := r.decodeAudioCensus(packet)
+	return audio, ok
+}
+
+// decodeAudioCensus is DecodeAudio with the TEMPORARY #40 census's two extra
+// facts: WHY a packet was refused, and where in the SRTP stream the one that
+// was accepted sat. DecodeAudio delegates to it so the report cannot describe
+// behaviour other than the behaviour that ran. kind is "" on success; the
+// CensusPacket is meaningful only then. Fold it back once #40 is closed.
+func (r *participantReceiveRegistry) decodeAudioCensus(packet []byte) (decodedParticipantAudio, string, CensusPacket, bool) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/ca4ba64503efeb86c337ee37cb00c4da540c632c/datasheets/group-media-receive.md#L37-L44
 	header, ok := rtp.ParseRtpHeader(packet)
 	if !ok {
-		return decodedParticipantAudio{}, false
+		return decodedParticipantAudio{}, CensusFailUnparsableRTP, CensusPacket{}, false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	receiver := r.bySSRC[header.Ssrc]
 	if receiver == nil {
 		r.log.Debug().Uint32("ssrc", header.Ssrc).Msg("dropping audio from inactive participant SSRC")
-		return decodedParticipantAudio{}, false
+		return decodedParticipantAudio{}, CensusFailNoContext, CensusPacket{}, false
 	}
 
 	receiver.mu.Lock()
 	defer receiver.mu.Unlock()
-	authenticatedHeader, payload, ok := receiver.pipe.UnprotectAudio(packet)
+	authenticatedHeader, payload, kind, roc, ok := receiver.pipe.unprotectAudioCensus(packet)
 	if !ok {
 		r.log.Debug().
 			Uint32("ssrc", header.Ssrc).
 			Str("participant_id", receiver.participantID).
 			Msg("participant audio failed authentication")
-		return decodedParticipantAudio{}, false
+		return decodedParticipantAudio{}, kind, CensusPacket{}, false
 	}
 	pcm := receiver.decoder.Decode(payload)
 	return decodedParticipantAudio{
@@ -875,5 +885,7 @@ func (r *participantReceiveRegistry) DecodeAudio(packet []byte) (decodedParticip
 		UserJID:       receiver.userJID, DeviceJID: receiver.deviceJID,
 		PID: receiver.pid, HasPID: receiver.hasPID, SSRC: authenticatedHeader.Ssrc,
 		Timestamp: authenticatedHeader.Timestamp, PCM: pcm,
+	}, "", CensusPacket{
+		Seq: authenticatedHeader.SequenceNumber, ROC: roc, SSRC: authenticatedHeader.Ssrc,
 	}, true
 }

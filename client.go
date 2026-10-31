@@ -31,6 +31,10 @@ type Client struct {
 	// (WithRelayEndpointObserver, engine_relay_diagnostics.go).
 	relayEndpointObserver func(RelayEndpointSelection)
 
+	// mediaCensusObserver is the temporary issue-#40 receive-path census hook
+	// (WithMediaCensusObserver, engine_media_census.go).
+	mediaCensusObserver func(MediaCensus)
+
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
 
@@ -62,6 +66,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 		wa: wa, log: cfg.log, diag: cfg.diag,
 		mediaPacketConn:       cfg.mediaPacketConn,
 		relayEndpointObserver: cfg.relayEndpointObserver,
+		mediaCensusObserver:   cfg.mediaCensusObserver,
 		getGroupInfo:          wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}

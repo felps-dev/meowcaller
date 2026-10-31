@@ -475,6 +475,38 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 	}()
 
+	// TEMPORARY #40 census (engine_media_census.go). Constructed here, next to
+	// relayRx, because it supersedes what relayRx can answer: relayRx is read
+	// twice, at 400ms and 900ms, to decide whether the allocate was delivered
+	// at all, and the open question is about a stream that DOES start and then
+	// stops. Both are kept — the two-sample check is load-bearing for a
+	// different failure and is not a census.
+	census := newMediaCensus(callID, inbound)
+	censusStarted := time.Now()
+	go func() {
+		t := time.NewTicker(mediaCensusInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				// NOT the final emission. This goroutine racing the receive
+				// loop's own teardown emit would report the counters twice and
+				// leave which one is complete undecided; the receive loop owns
+				// Final because it is the one that stops counting.
+				return
+			case <-t.C:
+			}
+			e.reportMediaCensus(census.snapshot(time.Since(censusStarted).Milliseconds(), false))
+		}
+	}()
+	// The teardown emission. Deferred rather than written at each return,
+	// because runMedia returns from a dozen places and a census that is
+	// missing for the one error path that mattered is the shape of bug this
+	// whole file exists to avoid.
+	defer func() {
+		e.reportMediaCensus(census.snapshot(time.Since(censusStarted).Milliseconds(), true))
+	}()
+
 	// Keepalive: re-send the Allocate AND a WhatsApp ping (0x0801) ~1 Hz. This matches the
 	// working capture exactly — allocate+ping every second, NO STUN binding-requests at
 	// all; the relay answers allocate-success + pong and bridges the peer's media.
@@ -836,9 +868,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			hasRosterGeneration = true
 		}
 		relayRx.Add(1)
+		census.datagram(n)
 		rawPkt := buf[:n]
 		pkt, groupWrapped, groupValid := relay.UnwrapGroupForwardingPacket(rawPkt)
 		if !groupValid {
+			census.classified(censusClassGroupInvalid)
 			if groupForwardingInvalid++; groupForwardingInvalid == 1 {
 				log.Warn().Int("packet_bytes", n).Msg("invalid group-forwarding relay packet")
 			}
@@ -846,6 +880,16 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		packetKind := relay.ClassifyRelayPacket(pkt)
 		isRTP := packetKind == relay.RelayPacketRtp
+		switch packetKind {
+		case relay.RelayPacketRtp:
+			census.classified(censusClassRTP)
+		case relay.RelayPacketRtcp:
+			census.classified(censusClassRTCP)
+		case relay.RelayPacketStun:
+			census.classified(censusClassSTUN)
+		default:
+			census.classified(censusClassOther)
+		}
 		e.c.diag.Emit("relay", map[string]any{
 			"event": "packet_in", "bytes": n, "is_rtp": isRTP,
 			"group_wrapped": groupWrapped, "group_header_bytes": n - len(pkt),
@@ -858,6 +902,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			}
 			plain, index, ok := audioReceivers.UnprotectSRTCP(senderSsrc, pkt)
 			if !ok {
+				census.rtcpAuthFailed()
 				if rtcpAuthFail++; rtcpAuthFail == 1 {
 					log.Warn().Uint32("ssrc", senderSsrc).Msg("peer SRTCP failed authentication")
 				}
@@ -898,6 +943,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					return fmt.Errorf("relay send binding-success: %w", err)
 				}
 				if answered {
+					census.stunBindingAnswered()
 					e.c.diag.Emit("stun", map[string]any{
 						"event": "binding_request_answered", "response_bytes": len(resp),
 					})
@@ -925,9 +971,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			rtpInspect++
 		}
 		if !vok {
+			census.rtpUnparsable()
 			continue
 		}
 		kind := classifyMediaPayload(vh)
+		census.payload(kind)
 		if kind == mediaPayloadAppData {
 			media, ok := audioReceivers.UnprotectAppData(pkt)
 			if !ok {
@@ -1082,14 +1130,16 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			})
 			continue
 		}
-		audio, ok := audioReceivers.DecodeAudio(pkt)
+		audio, censusKind, censusPkt, ok := audioReceivers.decodeAudioCensus(pkt)
 		if !ok {
+			census.unprotectFailed(censusKind)
 			if unprotectFail++; unprotectFail == 1 {
 				log.Warn().Uint32("ssrc", vh.Ssrc).Int("bytes", n).Msg("audio RTP did not match an authenticated active participant")
 			}
 			e.c.diag.Emit("srtp", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "bytes": n})
 			continue
 		}
+		census.decrypted(censusPkt, len(audio.PCM))
 		audioReception.Observe(audio.SSRC, vh.SequenceNumber, audio.Timestamp, uint64(time.Now().UnixMilli()), SampleRate)
 		e.c.diag.Emit("rtp", map[string]any{
 			"event": "in", "ssrc": audio.SSRC, "seq": vh.SequenceNumber,

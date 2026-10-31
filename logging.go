@@ -20,6 +20,10 @@ type config struct {
 	// relayEndpointObserver is the temporary issue-#40 diagnostic hook. See
 	// WithRelayEndpointObserver and engine_relay_diagnostics.go.
 	relayEndpointObserver func(RelayEndpointSelection)
+
+	// mediaCensusObserver is the temporary issue-#40 receive-path census hook.
+	// See WithMediaCensusObserver and engine_media_census.go.
+	mediaCensusObserver func(MediaCensus)
 }
 
 func resolveConfig(opts []Option) config {
@@ -61,6 +65,28 @@ func WithDiagnostics(rec *diag.Recorder) Option {
 // must not block.
 func WithRelayEndpointObserver(fn func(RelayEndpointSelection)) Option {
 	return func(c *config) { c.relayEndpointObserver = fn }
+}
+
+// WithMediaCensusObserver installs the TEMPORARY receive-path census: how
+// many datagrams arrived on the media socket, how they classified, how many
+// SRTP unprotects succeeded and how the rest failed, how many frames the
+// codec produced, and the sequence/ROC of the first and last decrypted
+// packet.
+//
+// It exists to answer ONE question about upstream issue
+// purpshell/meowcaller#40, the one the endpoint-selection diagnostic could
+// not: when inbound audio stops a few frames into every call, do datagrams
+// keep ARRIVING and stop decrypting, or do they stop arriving? Those answers
+// live in different halves of the stack, and the counters halve the search.
+//
+// fn is called periodically while the call's media runs — so a stall is
+// visible as it happens rather than only in the post-mortem — and once more
+// at teardown with Final set. It runs on library goroutines and must not
+// block. The report carries counters, sequence numbers, ROCs, SSRCs and
+// failure-kind names only: no key material, no call key, no payload bytes.
+// Goes away with the issue.
+func WithMediaCensusObserver(fn func(MediaCensus)) Option {
+	return func(c *config) { c.mediaCensusObserver = fn }
 }
 
 // WithMediaPacketConn makes every relay media connection run over the datagram
