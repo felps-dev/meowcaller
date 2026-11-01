@@ -22,7 +22,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// The live-relay media loop: connect+allocate to the elected relay, then run the
+// The live-relay media loop: connect+allocate to every offered relay (the
+// fan-out, engine_relay_fanout.go), then run the
 // per-frame send/recv loop. Outbound pulls frames from the Call's Player (silence when
 // idle), encodes via MLow + ProtectAudio, and sends to the relay; inbound classifies
 // relay packets, unprotects+decodes RTP, and writes to the Call's sink.
@@ -109,15 +110,110 @@ func (e *engine) maybeStartMedia(callID string) {
 	}()
 }
 
-// connectAndAllocate opens the relay DataChannel and sends the STUN allocate, returning
-// the channel and the allocate bytes (re-sent by the keepalive).
+// relayBinding is one fan-out target's outcome: the endpoint, and either its
+// open channel plus the allocate it was sent, or why it failed.
+type relayBinding struct {
+	ep       *relayEndpoint
+	ch       *relay.RelayMediaChannel
+	allocate []byte
+	err      error
+}
+
+// fanoutTargets is the preferred endpoint first, then every other offered
+// endpoint in offer order, once per address. multi=false is the original
+// single-relay behaviour, kept for group calls.
+func fanoutTargets(rd *relayData, primary *relayEndpoint, multi bool) []*relayEndpoint {
+	targets := []*relayEndpoint{primary}
+	if !multi {
+		return targets
+	}
+	seen := map[string]bool{fmt.Sprintf("%s:%d", primary.addresses[0].ipv4, primary.addresses[0].port): true}
+	for i := range rd.endpoints {
+		ep := &rd.endpoints[i]
+		if len(ep.addresses) == 0 {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", ep.addresses[0].ipv4, ep.addresses[0].port)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		targets = append(targets, ep)
+	}
+	return targets
+}
+
+// connectAndAllocateAll opens a relay DataChannel and sends the STUN allocate
+// on every usable relay in the offer, returning them as one fanout (upstream
+// PR #26). Phones run client relay election shortly after accept and migrate
+// their media to the offered relay they measured closest; being bound
+// everywhere makes that migration a non-event. The preferred endpoint stays
+// first so anything with primary-relay semantics (the group path) is
+// unchanged. It also returns every target's outcome, for the endpoint report.
+//
+// The connects run in PARALLEL, where #26 ran them one after another: a dead
+// secondary would otherwise hold the live relays' first RTP behind its 12 s
+// timeout, and the time from offer to allocate is exactly what decides
+// whether the relay bridges the caller. Each connect gets its own socket from
+// the integrator's factory (see relaySocket).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool) (*relayFanout, []relayBinding, error) {
+	primary := getMediaRelayEndpoint(rd, inbound)
+	if primary == nil || len(primary.addresses) == 0 {
+		return nil, nil, fmt.Errorf("relay has no usable endpoint")
+	}
+	targets := fanoutTargets(rd, primary, multi)
+	bindings := make([]relayBinding, len(targets))
+	var wg sync.WaitGroup
+	for i, ep := range targets {
+		bindings[i].ep = ep
+		wg.Add(1)
+		go func(b *relayBinding) {
+			defer wg.Done()
+			b.ch, b.allocate, b.err = e.connectOneRelay(ctx, rd, b.ep, streamSsrcs)
+		}(&bindings[i])
+	}
+	wg.Wait()
+
+	var chans []relayConn
+	var allocs [][]byte
+	var names []string
+	for _, b := range bindings {
+		if b.err != nil {
+			// A secondary relay failing is survivable; every relay failing is
+			// not.
+			e.c.log.Warn().Err(b.err).Str("relay_name", b.ep.relayName).Msg("relay connect failed; continuing without it")
+			continue
+		}
+		chans = append(chans, b.ch)
+		allocs = append(allocs, b.allocate)
+		names = append(names, b.ep.relayName)
+	}
+	if len(chans) == 0 {
+		return nil, bindings, fmt.Errorf("no relay reachable (%d offered)", len(targets))
+	}
+	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
+	return newRelayFanout(chans, allocs, names), bindings, nil
+}
+
+// connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
+// single endpoint, returning the channel and the allocate bytes (re-sent by the
+// keepalive).
+//
+// NOT VALIDATED: live-relay only.
+func (e *engine) connectOneRelay(ctx context.Context, rd *relayData, ep *relayEndpoint, streamSsrcs [9]uint32) (*relay.RelayMediaChannel, []byte, error) {
 	log := e.c.log
-	ep := getMediaRelayEndpoint(rd, inbound)
 	if ep == nil || len(ep.addresses) == 0 {
 		return nil, nil, fmt.Errorf("relay has no usable endpoint")
+	}
+	// Checked BEFORE dialling, where the single-relay path checked after: an
+	// endpoint we cannot allocate on must not cost a socket and a handshake.
+	if int(ep.tokenID) >= len(rd.relayTokens) || rd.relayTokens[ep.tokenID] == nil {
+		return nil, nil, fmt.Errorf("no relay token #%d", ep.tokenID)
+	}
+	if len(rd.relayKeyASCII) == 0 {
+		return nil, nil, fmt.Errorf("relay has no <key>")
 	}
 	addr := &net.UDPAddr{IP: net.ParseIP(ep.addresses[0].ipv4), Port: int(ep.addresses[0].port)}
 	log.Info().Str("relay_name", ep.relayName).Str("addr", addr.String()).Msg("connecting media transport to relay")
@@ -126,14 +222,11 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 		"ipv4": ep.addresses[0].ipv4, "port": ep.addresses[0].port, "token_id": ep.tokenID,
 	})
 
-	type result struct {
-		ch  *relay.RelayMediaChannel
-		err error
-	}
-	done := make(chan result, 1)
+	sock := newRelaySocket(e.c.mediaPacketConn)
+	done := make(chan relayConnectResult, 1)
 	go func() {
-		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log), relay.WithPacketConn(e.c.mediaPacketConn))
-		done <- result{ch, err}
+		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log), relay.WithPacketConn(sock.dial))
+		done <- relayConnectResult{ch, err}
 	}()
 	var ch *relay.RelayMediaChannel
 	select {
@@ -143,20 +236,14 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 		}
 		ch = r.ch
 	case <-time.After(12 * time.Second):
+		sock.abandon(done)
 		return nil, nil, fmt.Errorf("relay connect timed out (DTLS didn't complete)")
 	case <-ctx.Done():
+		sock.abandon(done)
 		return nil, nil, ctx.Err()
 	}
 	log.Info().Str("relay_name", ep.relayName).Msg("relay DataChannel open")
 
-	if int(ep.tokenID) >= len(rd.relayTokens) || rd.relayTokens[ep.tokenID] == nil {
-		ch.Close()
-		return nil, nil, fmt.Errorf("no relay token #%d", ep.tokenID)
-	}
-	if len(rd.relayKeyASCII) == 0 {
-		ch.Close()
-		return nil, nil, fmt.Errorf("relay has no <key>")
-	}
 	e.c.diag.Emit("relay", map[string]any{
 		"event": "keying", "token_id": ep.tokenID, "token_count": len(rd.relayTokens),
 		"relay_key_bytes": len(rd.relayKeyASCII),
@@ -174,9 +261,9 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 		ch.Close()
 		return nil, nil, fmt.Errorf("allocate send: %w", err)
 	}
-	log.Info().Int("bytes", len(allocate)).Msg("sent STUN allocate")
+	log.Info().Str("relay_name", ep.relayName).Int("bytes", len(allocate)).Msg("sent STUN allocate")
 	e.c.diag.Emit("stun", map[string]any{
-		"event": "allocate_sent", "bytes": len(allocate),
+		"event": "allocate_sent", "relay_name": ep.relayName, "bytes": len(allocate),
 		"tx_id_hex":    hex.EncodeToString(tx[:]),
 		"stream_ssrcs": streamSsrcs,
 	})
@@ -226,13 +313,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// once per call, here, because this is the last point at which rd is
 	// final and the transport has not been dialled yet.
 	e.reportRelaySelection(callID, rd, inbound)
-	ch, allocate, err := e.connectAndAllocate(ctx, rd, streamSsrcs, inbound)
+	e.mu.Lock()
+	isGroup := false
+	if mm := e.calls[callID]; mm != nil {
+		isGroup = mm.group
+	}
+	e.mu.Unlock()
+
+	ch, _, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
-		allocate,
+		ch.allocs[0],
 		rd.relayKeyASCII,
 		[2]uint32{hbhFECTXSSRC, hbhFECRXSSRC},
 	)
@@ -561,7 +655,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 							connectedRemoteParticipantPIDs(*update, audioReceivers.selfID),
 							relayTx,
 							func(packet []byte) error {
-								_, sendErr := ch.Send(packet)
+								// Group allocations are relay-specific state; they stay
+								// on the primary relay, matching the pre-fanout behavior.
+								_, sendErr := ch.PrimarySend(packet)
 								return sendErr
 							},
 						)
@@ -583,10 +679,16 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 			}
 			if !allocateSent {
-				if err := allocateState.SendCurrent(func(packet []byte) error {
-					_, sendErr := ch.Send(packet)
-					return sendErr
-				}); err != nil {
+				if isGroup {
+					if err := allocateState.SendCurrent(func(packet []byte) error {
+						_, sendErr := ch.PrimarySend(packet)
+						return sendErr
+					}); err != nil {
+						return
+					}
+				} else if err := ch.ResendAllocates(); err != nil {
+					// Allocates embed per-relay tokens, so each relay must be
+					// refreshed with its own payload rather than a broadcast.
 					return
 				}
 			}
@@ -854,6 +956,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 
 	buf := make([]byte, 1500)
+	rtpDedup := newRtpReplayFilter()
 	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, groupForwardingInvalid uint64
 	for {
 		if ctx.Err() != nil {
@@ -1014,6 +1117,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		if !vok {
 			census.rtpUnparsable()
+			continue
+		}
+		// With bind-to-all, the same packet can arrive once per relay. A
+		// duplicate reaching the playout buffer reads as a zero timestamp delta
+		// and resets it, so drop replays before any processing.
+		if rtpDedup.Duplicate(vh.Ssrc, vh.SequenceNumber) {
 			continue
 		}
 		kind := classifyMediaPayload(vh)
@@ -1368,11 +1477,17 @@ func videoRtpDurationSamples(duration time.Duration) uint32 {
 // fed encoded H.264 (e.g. from the VideoBridge / WebCodecs), not raw frames.
 //
 // NOT VALIDATED: the video send media path is unproven.
+// relayMediaSender is the write half shared by the single relay channel and the
+// fanout, so senders don't care whether one relay or all of them are behind it.
+type relayMediaSender interface {
+	Send(data []byte) (int, error)
+}
+
 type videoSender struct {
 	mu               sync.Mutex
 	pipe             *MediaPipeline
 	stream           *rtp.VideoRtpStream
-	ch               *relay.RelayMediaChannel
+	ch               relayMediaSender
 	ssrc             uint32
 	callID           string
 	frame            uint64

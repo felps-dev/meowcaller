@@ -657,7 +657,8 @@ func (e *engine) ringInbound(callID string, from, creator types.JID, isVideo boo
 // armEarlyMediaRingLimit starts the earlyMediaRingLimit timer for a ringing
 // inbound call.
 func (e *engine) armEarlyMediaRingLimit(callID string) {
-	t := time.AfterFunc(earlyMediaRingLimit, func() { e.expireEarlyMedia(callID) })
+	limit := earlyMediaRingLimit
+	t := time.AfterFunc(limit, func() { e.expireEarlyMedia(callID, limit) })
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	m := e.calls[callID]
@@ -673,7 +674,7 @@ func (e *engine) armEarlyMediaRingLimit(callID string) {
 // the caller has already given up on must not hold relay sockets. An Answer
 // that arrives after this commits to a call with no media, which the
 // integrator's own answer deadline then ends.
-func (e *engine) expireEarlyMedia(callID string) {
+func (e *engine) expireEarlyMedia(callID string, limit time.Duration) {
 	e.mu.Lock()
 	m := e.calls[callID]
 	if m == nil || m.answered {
@@ -688,7 +689,7 @@ func (e *engine) expireEarlyMedia(callID string) {
 	if cancel != nil {
 		cancel()
 	}
-	e.c.log.Warn().Str("call_id", callID).Dur("ring_limit", earlyMediaRingLimit).
+	e.c.log.Warn().Str("call_id", callID).Dur("ring_limit", limit).
 		Msg("unanswered call rang past the ring limit; early media stopped")
 }
 
@@ -906,6 +907,14 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 
 // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
 // relay election). It does NOT send the accept — that is deferred until <mute_v2>.
+//
+// Only probes for relays IN THE OFFER are answered (upstream PR #26). The caller's
+// probes routinely include its own nearest edge, which is absent from the offer and
+// holds no tokens for us; echoing that entry back tells the caller both sides reach
+// it, the election picks it, and the caller's media moves to a relay we were never
+// connected to — a few packets on our relay, then silence, with our allocation
+// healthy. No choice among offered relays can fix that, which is why three endpoint
+// experiments on the fork all failed.
 func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	m := e.lookup(ev.CallID)
 	if m == nil || m.direction != CallDirectionIncoming {
@@ -915,18 +924,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	if rl == nil {
 		return
 	}
-	var probes []rlProbe
-	for i := range rl.GetChildren() {
-		te := &rl.GetChildren()[i]
-		if te.Tag != "te" {
-			continue
-		}
-		ag := te.AttrGetter()
-		probes = append(probes, rlProbe{
-			latency:   decodeLatency(ag.String("latency")),
-			relayName: ag.String("relay_name"),
-			addr:      nodeBytes(te),
-		})
+	e.mu.Lock()
+	offered := offeredRelayNames(m.relay)
+	e.mu.Unlock()
+
+	probes, _, skipped := selectLatencyProbes(rl, offered)
+	for _, name := range skipped {
+		e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", name).Msg("skipping latency response for relay outside the offer")
 	}
 	for _, p := range probes {
 		resp := signaling.BuildRelayLatency(&signaling.RelayLatencyParams{
@@ -937,12 +941,53 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			RelayName:    p.relayName,
 			AddressBytes: p.addr,
 		})
-		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
+		resp.Attrs["id"] = e.nextCallNodeID()
+		if err := e.transmitCallNode(context.Background(), resp); err != nil {
 			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
 			return
 		}
 	}
+}
+
+// offeredRelayNames is the set of relay names in an offer's <relay> endpoints.
+func offeredRelayNames(rd *relayData) map[string]bool {
+	offered := map[string]bool{}
+	if rd == nil {
+		return offered
+	}
+	for i := range rd.endpoints {
+		if name := rd.endpoints[i].relayName; name != "" {
+			offered[name] = true
+		}
+	}
+	return offered
+}
+
+// selectLatencyProbes reads the caller's <te> probes and returns the ones to
+// answer, every relay name probed (in order), and the names skipped as outside
+// the offer. An empty offered set answers everything, as before #26: with no
+// relay names to compare against, refusing every probe would leave the caller
+// with no election at all.
+func selectLatencyProbes(rl *waBinary.Node, offered map[string]bool) (answer []rlProbe, probed, skipped []string) {
+	for i := range rl.GetChildren() {
+		te := &rl.GetChildren()[i]
+		if te.Tag != "te" {
+			continue
+		}
+		ag := te.AttrGetter()
+		name := ag.String("relay_name")
+		probed = append(probed, name)
+		if len(offered) > 0 && !offered[name] {
+			skipped = append(skipped, name)
+			continue
+		}
+		answer = append(answer, rlProbe{
+			latency:   decodeLatency(ag.String("latency")),
+			relayName: name,
+			addr:      nodeBytes(te),
+		})
+	}
+	return answer, probed, skipped
 }
 
 // onPreAccept records that the peer's device received and started preparing an outgoing call.
@@ -1801,7 +1846,8 @@ func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
 // selectMediaRelayEndpoint is getMediaRelayEndpoint plus the NAME of the branch
 // that decided, so the choice can be reported without a second copy of the
 // heuristic (see engine_relay_diagnostics.go, temporary, upstream issue #40).
-// The branches and their order are unchanged.
+// The branches and their order are upstream's. Under the fan-out it picks the
+// PRIMARY relay only: listed first, and the only relay the group path uses.
 func selectMediaRelayEndpoint(rd *relayData, inbound bool) (*relayEndpoint, string) {
 	if inbound {
 		for i := range rd.endpoints {
