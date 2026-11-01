@@ -317,6 +317,26 @@ type MediaCensus struct {
 	// live call would be its own finding, so both are published even at zero.
 	AllocateRefreshes       uint64 `json:"allocate_refreshes"`
 	AllocateRefreshTxReused uint64 `json:"allocate_refresh_tx_reused"`
+
+	// Relays is the inbound traffic per bound relay, keyed by relay name: the
+	// fan-out (upstream PR #26) binds every offered relay, and this says which
+	// one the caller's media actually came through — and whether it moved.
+	Relays map[string]CensusRelay `json:"relays,omitempty"`
+
+	// Duplicates is RTP dropped because the same (SSRC, seq) already arrived
+	// through another relay. Non-zero means two relays bridged the caller.
+	Duplicates uint64 `json:"duplicates"`
+
+	// Trace is the relay election and the offer->media->answer timeline, for
+	// an inbound call (engine_call_trace.go).
+	Trace *CensusTrace `json:"trace,omitempty"`
+}
+
+// CensusRelay is one bound relay's inbound share.
+type CensusRelay struct {
+	Datagrams  uint64 `json:"datagrams"`
+	RTP        uint64 `json:"rtp"`
+	Duplicates uint64 `json:"duplicates"`
 }
 
 // RefreshReusesInitialTransactionID is the at-a-glance form of the two ids: a
@@ -368,7 +388,45 @@ func (c MediaCensus) Summary() string {
 	fmt.Fprintf(&b, " allocate_refreshes=%d tx_initial=%s tx_refresh=%s tx_reused=%t",
 		c.AllocateRefreshes, censusTxOrNone(c.AllocateTxInitial),
 		censusTxOrNone(c.AllocateTxRefresh), c.RefreshReusesInitialTransactionID())
+	if len(c.Relays) > 0 {
+		names := make([]string, 0, len(c.Relays))
+		for name := range c.Relays {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		parts := make([]string, 0, len(names))
+		for _, name := range names {
+			r := c.Relays[name]
+			parts = append(parts, fmt.Sprintf("%s:%d/%d/%d", name, r.Datagrams, r.RTP, r.Duplicates))
+		}
+		fmt.Fprintf(&b, " relays(dgram/rtp/dup)=[%s] duplicates=%d", strings.Join(parts, " "), c.Duplicates)
+	}
+	if c.Trace != nil {
+		fmt.Fprintf(&b, " offer_relays=[%s] probed=[%s] skipped=[%s] timeline=[%s]",
+			strings.Join(c.Trace.OfferRelays, " "),
+			renderCensusCounters(c.Trace.ProbedRelays, nil),
+			renderCensusCounters(c.Trace.SkippedRelays, nil),
+			c.Trace.Timeline.String())
+	}
 	return b.String()
+}
+
+// String renders the timeline as "callkey=12 media_start=14 ..." in event
+// order, omitting what has not happened.
+func (t CensusTimeline) String() string {
+	var parts []string
+	for _, f := range []struct {
+		name string
+		v    *int64
+	}{
+		{"callkey", t.CallKeyMS}, {"media_start", t.MediaStartMS}, {"mute_v2", t.MuteV2MS},
+		{"answer", t.AnswerMS}, {"accept_sent", t.AcceptSentMS}, {"first_rtp", t.FirstRTPMS},
+	} {
+		if f.v != nil {
+			parts = append(parts, fmt.Sprintf("%s=%d", f.name, *f.v))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // censusTxOrNone renders a transaction id, or "none" for one we never saw —
@@ -402,6 +460,51 @@ type mediaCensus struct {
 	stunTypes      map[string]uint64
 	stunOtherTypes map[string]uint64
 	allocateErrors map[string]uint64
+
+	// Per-relay inbound, indexed like relayNames (the fan-out's order).
+	relayNames []string
+	relays     []CensusRelay
+	// trace is the call's election/timeline collector, nil for outbound.
+	trace *callTrace
+}
+
+// bindRelays names the fan-out's relays, in its index order, and attaches the
+// call's trace. Called once, before the receive loop.
+func (c *mediaCensus) bindRelays(names []string, trace *callTrace) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.relayNames = append([]string(nil), names...)
+	c.relays = make([]CensusRelay, len(names))
+	c.trace = trace
+}
+
+// relayDatagram attributes one datagram to the relay it came through, and
+// relayRTP one that classified as RTP. An index outside the bound set is
+// ignored.
+func (c *mediaCensus) relayDatagram(relay int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if relay >= 0 && relay < len(c.relays) {
+		c.relays[relay].Datagrams++
+	}
+}
+
+func (c *mediaCensus) relayRTP(relay int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if relay >= 0 && relay < len(c.relays) {
+		c.relays[relay].RTP++
+	}
+}
+
+// duplicate counts RTP dropped as already seen through another relay.
+func (c *mediaCensus) duplicate(relay int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snap.Duplicates++
+	if relay >= 0 && relay < len(c.relays) {
+		c.relays[relay].Duplicates++
+	}
 }
 
 func newMediaCensus(callID string, inbound bool) *mediaCensus {
@@ -646,6 +749,17 @@ func (c *mediaCensus) snapshot(elapsedMS int64, final bool) MediaCensus {
 		last := *c.snap.Last
 		out.Last = &last
 	}
+	if len(c.relays) > 0 {
+		out.Relays = make(map[string]CensusRelay, len(c.relays))
+		for i, r := range c.relays {
+			name := c.relayNames[i]
+			if _, dup := out.Relays[name]; dup || name == "" {
+				name = fmt.Sprintf("%s#%d", name, i)
+			}
+			out.Relays[name] = r
+		}
+	}
+	out.Trace = c.trace.snapshot()
 	return out
 }
 
@@ -714,6 +828,9 @@ func (e *engine) reportMediaCensus(c MediaCensus) {
 		Str("allocate_tx_initial", c.AllocateTxInitial).
 		Str("allocate_tx_refresh", c.AllocateTxRefresh).
 		Bool("allocate_refresh_reuses_tx", c.RefreshReusesInitialTransactionID()).
+		Interface("relays", c.Relays).
+		Uint64("duplicates", c.Duplicates).
+		Interface("trace", c.Trace).
 		Msg("media census (temporary diagnostic, upstream issue #40)")
 	e.c.diag.Emit("relay", map[string]any{
 		"event": "media_census", "call_id": c.CallID, "final": c.Final,
@@ -724,6 +841,7 @@ func (e *engine) reportMediaCensus(c MediaCensus) {
 		"allocate_errors": c.AllocateErrors, "first_allocate_error": c.FirstAllocateError,
 		"allocate_refreshes":  c.AllocateRefreshes,
 		"allocate_tx_initial": c.AllocateTxInitial, "allocate_tx_refresh": c.AllocateTxRefresh,
+		"relays": c.Relays, "duplicates": c.Duplicates, "trace": c.Trace,
 	})
 	if fn := e.c.mediaCensusObserver; fn != nil {
 		fn(c)

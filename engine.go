@@ -91,6 +91,10 @@ type engineCall struct {
 	// caller's own terminate never reaches us. Stopped by Answer and by
 	// finishCall.
 	ringLimit *time.Timer
+
+	// trace is the TEMPORARY election/timeline diagnostic for an inbound call
+	// (engine_call_trace.go); nil for outbound calls.
+	trace *callTrace
 }
 
 // earlyMediaRingLimit bounds how long an UNANSWERED inbound call may hold its
@@ -542,6 +546,7 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 // listener and starts media early (see ringInbound). Only the <accept> is deferred to
 // Answer.
 func (e *engine) onOffer(ev *events.CallOffer) {
+	trace := newCallTrace(time.Now())
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
 	if groupErr != nil {
@@ -567,6 +572,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("decrypt callKey failed")
 		return
 	}
+	trace.mark(traceCallKey)
 	e.c.log.Info().Int("key_bytes", len(callKey)).Str("call_id", ev.CallID).Msg("decrypted inbound callKey")
 	e.c.diag.Emit("keying", map[string]any{
 		"call_id": ev.CallID, "direction": "in", "from": ev.From.String(),
@@ -592,6 +598,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	m.creator = ev.CallCreator
 	m.from = ev.From
 	m.direction = CallDirectionIncoming
+	m.trace = trace
 	// A <video> child marks a call that starts with both video directions enabled.
 	isVideo := signaling.OfferHasVideo(ev.Data)
 	m.localVideo = isVideo
@@ -608,6 +615,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		if !m.relay.peerJID.IsEmpty() {
 			m.peerLID = m.relay.peerJID.String()
 		}
+		trace.offerRelays(m.relay)
 	}
 	e.applyVoipSettingsCodec(m, ev.Data, ev.CallID)
 	e.mu.Unlock()
@@ -791,6 +799,7 @@ func (e *engine) answer(c *Call) error {
 		m.ringLimit = nil
 	}
 	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
+	m.trace.mark(traceAnswer)
 	e.mu.Unlock()
 
 	// A no-op when early media is already running; it brings media up for a
@@ -820,6 +829,7 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 	}
 	isVideo := m.localVideo || m.remoteVideo
 	m.acceptPending = false
+	trace := m.trace
 	e.mu.Unlock()
 
 	accept := signaling.BuildAccept(&signaling.AcceptParams{
@@ -833,6 +843,7 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
 		return
 	}
+	trace.mark(traceAcceptSent)
 	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
 }
 
@@ -885,6 +896,7 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 		return
 	}
 	m.relay = rd
+	m.trace.offerRelays(rd)
 	if !rd.peerJID.IsEmpty() {
 		peerLID = rd.peerJID.String()
 		if peerLID != m.peerLID {
@@ -926,9 +938,11 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	}
 	e.mu.Lock()
 	offered := offeredRelayNames(m.relay)
+	trace := m.trace
 	e.mu.Unlock()
 
-	probes, _, skipped := selectLatencyProbes(rl, offered)
+	probes, probed, skipped := selectLatencyProbes(rl, offered)
+	trace.probes(probed, skipped)
 	for _, name := range skipped {
 		e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", name).Msg("skipping latency response for relay outside the offer")
 	}
@@ -1257,6 +1271,9 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 			m.earlyMuteSeen = true
 			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
 			m.earlyMuteCreator = mv.JID("call-creator")
+		}
+		if m != nil {
+			m.trace.mark(traceMuteV2)
 		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {

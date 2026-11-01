@@ -237,6 +237,11 @@ func TestTheEmittedCensusCarriesNoSecretOrPayload(t *testing.T) {
 		"code": true, "code_found": true,
 		"allocate_tx_initial": true, "allocate_tx_refresh": true,
 		"allocate_refreshes": true, "allocate_refresh_tx_reused": true,
+		// The fan-out port (#26): per-relay inbound counters keyed by relay
+		// NAME (a server-chosen identifier such as "gru2c01", already logged
+		// by the endpoint report), duplicates dropped, and the election /
+		// timeline trace — relay names and millisecond offsets.
+		"duplicates": true, "relays": true, "trace": true,
 	}
 	for _, kind := range censusStunKinds {
 		allowed[kind] = true

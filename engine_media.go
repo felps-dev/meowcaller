@@ -94,6 +94,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
+	m.trace.mark(traceMediaStart)
 	e.mu.Unlock()
 
 	// An inbound call started EARLY (upstream PR #43) stays ringing: the
@@ -309,10 +310,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	// TEMPORARY (upstream issue #40): report the relay endpoint selection
-	// once per call, here, because this is the last point at which rd is
-	// final and the transport has not been dialled yet.
-	e.reportRelaySelection(callID, rd, inbound)
 	e.mu.Lock()
 	isGroup := false
 	if mm := e.calls[callID]; mm != nil {
@@ -320,7 +317,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 	e.mu.Unlock()
 
-	ch, _, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
+	ch, bindings, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
+	// TEMPORARY (upstream issue #40): report every relay bound, once per
+	// call, whether or not any came up.
+	e.reportRelaySelection(callID, rd, inbound, !isGroup, bindings)
 	if err != nil {
 		return err
 	}
@@ -578,6 +578,13 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// stops. Both are kept — the two-sample check is load-bearing for a
 	// different failure and is not a census.
 	census := newMediaCensus(callID, inbound)
+	e.mu.Lock()
+	var trace *callTrace
+	if mm := e.calls[callID]; mm != nil {
+		trace = mm.trace
+	}
+	e.mu.Unlock()
+	census.bindRelays(ch.names, trace)
 	censusStarted := time.Now()
 	// TEMPORARY #40, patch 5: the allocate transaction id as built at
 	// connect. Every 1 Hz refresh is compared against it, because SendCurrent
@@ -962,7 +969,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		n, err := ch.Recv(buf)
+		n, relayIndex, err := ch.RecvFrom(buf)
 		if err != nil {
 			return fmt.Errorf("relay recv: %w", err)
 		}
@@ -986,6 +993,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		relayRx.Add(1)
 		census.datagram(n)
+		census.relayDatagram(relayIndex)
 		rawPkt := buf[:n]
 		pkt, groupWrapped, groupValid := relay.UnwrapGroupForwardingPacket(rawPkt)
 		if !groupValid {
@@ -1000,6 +1008,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		switch packetKind {
 		case relay.RelayPacketRtp:
 			census.classified(censusClassRTP)
+			census.relayRTP(relayIndex)
 		case relay.RelayPacketRtcp:
 			census.classified(censusClassRTCP)
 		case relay.RelayPacketStun:
@@ -1123,6 +1132,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		// duplicate reaching the playout buffer reads as a zero timestamp delta
 		// and resets it, so drop replays before any processing.
 		if rtpDedup.Duplicate(vh.Ssrc, vh.SequenceNumber) {
+			census.duplicate(relayIndex)
 			continue
 		}
 		kind := classifyMediaPayload(vh)
@@ -1771,6 +1781,7 @@ func (e *engine) onFirstInboundRTP(callID string, call *Call) {
 	e.mu.Lock()
 	if em := e.calls[callID]; em != nil {
 		em.inboundSeen = true
+		em.trace.mark(traceFirstRTP)
 		promote = em.direction != CallDirectionIncoming || em.answered
 	}
 	e.mu.Unlock()

@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -64,7 +65,7 @@ func TestTheReportNamesTheBranchThatChose(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			sel := describeRelaySelection("CALLID", tc.rd, tc.inbound)
+			sel := describeRelaySelection("CALLID", tc.rd, tc.inbound, true, nil)
 			if sel.Branch != tc.branch {
 				t.Fatalf("branch = %q, want %q", sel.Branch, tc.branch)
 			}
@@ -105,7 +106,9 @@ func TestTheReportCarriesNoKeyMaterial(t *testing.T) {
 		relayTokens:   [][]byte{[]byte("SECRETTOKENBYTES")},
 		endpoints:     []relayEndpoint{ep("gru1c01", true, 0, "1.1.1.1", 3478)},
 	}
-	sel := describeRelaySelection("CALLID", rd, true)
+	sel := describeRelaySelection("CALLID", rd, true, true, []relayBinding{
+		{ep: &rd.endpoints[0], err: errors.New("relay connect: dtls handshake: timeout")},
+	})
 	encoded, err := json.Marshal(sel)
 	if err != nil {
 		t.Fatal(err)
@@ -122,5 +125,41 @@ func TestTheReportCarriesNoKeyMaterial(t *testing.T) {
 	}
 	if !strings.Contains(sel.Summary(), "1.1.1.1") || !strings.Contains(sel.Summary(), "branch=inbound_fna") {
 		t.Fatalf("summary is missing the endpoint or the branch: %s", sel.Summary())
+	}
+}
+
+// TestTheReportListsEveryRelayBound is patch 2 adjusted for the fan-out: the
+// report names EVERY relay the call is on and every one that failed, not one
+// chosen endpoint — the question is no longer which relay we picked.
+func TestTheReportListsEveryRelayBound(t *testing.T) {
+	rd := &relayData{endpoints: []relayEndpoint{
+		epToken("gig4c02", 0, "4.4.4.4", 3478),
+		epToken("gru2c01", 1, "6.6.6.6", 3478),
+		epToken("poa1c01", 2, "3.3.3.3", 3478),
+	}}
+	bindings := []relayBinding{
+		{ep: &rd.endpoints[0]},
+		{ep: &rd.endpoints[1]},
+		{ep: &rd.endpoints[2], err: errors.New("relay connect timed out (DTLS didn't complete)")},
+	}
+	sel := describeRelaySelection("CALLID", rd, true, true, bindings)
+
+	if !sel.FanOut {
+		t.Fatal("a 1:1 report says fan_out=false")
+	}
+	var bound []string
+	for _, b := range sel.Bound {
+		bound = append(bound, b.RelayName)
+	}
+	if strings.Join(bound, ",") != "gig4c02,gru2c01" {
+		t.Fatalf("bound = %v, want both relays that came up, primary first", bound)
+	}
+	if len(sel.Failed) != 1 || sel.Failed[0].Relay.RelayName != "poa1c01" || !strings.Contains(sel.Failed[0].Error, "timed out") {
+		t.Fatalf("failed = %+v, want poa1c01 with its reason", sel.Failed)
+	}
+	for _, want := range []string{"bound=[gig4c02 gru2c01]", "failed=[poa1c01(", "fan_out=true"} {
+		if !strings.Contains(sel.Summary(), want) {
+			t.Fatalf("summary lacks %q: %s", want, sel.Summary())
+		}
 	}
 }

@@ -3,13 +3,13 @@ package meowcaller
 // TEMPORARY DIAGNOSTIC — remove once purpshell/meowcaller#40 is understood.
 //
 // Issue #40 is "no inbound audio when the offer carries no is_fna endpoint",
-// reported from Brazil against the poa/gru/mia relays. The selection that
-// decides which relay a call's media is allocated on lives in
-// getMediaRelayEndpoint, over unexported types, so from outside this module
-// there is no way to tell WHICH branch ran for a call that went silent. This
-// file makes exactly that observable and nothing else: the endpoint list as
-// parsed from the offer's <relay> node, which entry was chosen, and the name
-// of the branch that chose it.
+// reported from Brazil against the poa/gru/mia relays. The relays a call's
+// media is bound to are decided over unexported types, so from outside this
+// module there is no way to tell which ones a silent call was on. This file
+// makes exactly that observable and nothing else: the endpoint list as parsed
+// from the offer's <relay> node, the PRIMARY entry and the branch that chose
+// it, and — since the fan-out (upstream PR #26) binds every offered relay —
+// every relay that was actually bound, and why any other was not.
 //
 // It carries no key, no token bytes, no call key and no media. Relay
 // addresses, ports, token IDs and the is_fna flag are the whole payload,
@@ -60,18 +60,25 @@ func (i RelayEndpointInfo) String() string {
 		i.RelayName, i.IPv4, i.Port, i.RelayID, i.TokenID, i.AuthTokenID, i.IsFNA)
 }
 
-// RelayEndpointSelection is the once-per-call diagnostic report.
+// RelayBindFailure is one offered relay the fan-out could not bind, and why.
+// The error is the connect or allocate failure as text: no key, no token.
+type RelayBindFailure struct {
+	Relay RelayEndpointInfo `json:"relay"`
+	Error string            `json:"error"`
+}
+
+// RelayEndpointSelection is the once-per-call diagnostic report, emitted once
+// the relays have been dialled.
 //
-// # There is ONE endpoint per call, not one per direction
+// # One call, every offered relay
 //
-// getMediaRelayEndpoint is called with `inbound` meaning "this call is an
-// incoming one", not "this is the inbound media direction". Its result is
-// used twice and identically for both directions: as the UDP destination the
-// relay DataChannel is dialled to, and as the XOR-RELAYED-ADDRESS of the STUN
-// allocate that tells the relay where to bridge. So Chosen is the endpoint
-// inbound RTP arrives on AND the one outbound RTP leaves to; there is no
-// second selection to report. InboundAndOutboundShareEndpoint records that
-// as a fact of this revision rather than leaving a reader to assume it.
+// A 1:1 call is bound to EVERY offered relay (upstream PR #26): each gets its
+// own socket, DataChannel and allocate; outbound media is broadcast to all of
+// them and inbound is merged from all of them. Bound lists the relays that
+// came up and Failed the ones that did not. Chosen is the PRIMARY — listed
+// first in the fan-out and the only relay a group call uses — and Branch names
+// the rule that picked it. Which relay the caller's media actually ARRIVED on
+// is in the media census (MediaCensus.Relays), not here.
 type RelayEndpointSelection struct {
 	CallID string `json:"call_id"`
 
@@ -93,10 +100,17 @@ type RelayEndpointSelection struct {
 	// ChosenIndex indexes Endpoints, or -1 when Branch is RelayBranchNone.
 	ChosenIndex int `json:"chosen_index"`
 
-	// Chosen is nil only when Branch is RelayBranchNone.
+	// Chosen is the primary; nil only when Branch is RelayBranchNone.
 	Chosen *RelayEndpointInfo `json:"chosen,omitempty"`
 
-	InboundAndOutboundShareEndpoint bool `json:"inbound_and_outbound_share_endpoint"`
+	// FanOut is false for a group call, which binds the primary only.
+	FanOut bool `json:"fan_out"`
+
+	// Bound is every relay the call's media is on, primary first.
+	Bound []RelayEndpointInfo `json:"bound"`
+
+	// Failed is every relay the fan-out tried and could not bind.
+	Failed []RelayBindFailure `json:"failed,omitempty"`
 }
 
 // Summary is the one-line human form, used as the log message's detail and
@@ -110,8 +124,17 @@ func (s RelayEndpointSelection) Summary() string {
 	if s.Chosen != nil {
 		chosen = s.Chosen.String()
 	}
-	return fmt.Sprintf("inbound=%t branch=%s fna_count=%d chosen=%s endpoints=[%s]",
-		s.Inbound, s.Branch, s.FNACount, chosen, strings.Join(parts, " "))
+	bound := make([]string, 0, len(s.Bound))
+	for _, b := range s.Bound {
+		bound = append(bound, b.RelayName)
+	}
+	failed := make([]string, 0, len(s.Failed))
+	for _, f := range s.Failed {
+		failed = append(failed, fmt.Sprintf("%s(%s)", f.Relay.RelayName, f.Error))
+	}
+	return fmt.Sprintf("inbound=%t fan_out=%t bound=[%s] failed=[%s] branch=%s fna_count=%d chosen=%s endpoints=[%s]",
+		s.Inbound, s.FanOut, strings.Join(bound, " "), strings.Join(failed, " "),
+		s.Branch, s.FNACount, chosen, strings.Join(parts, " "))
 }
 
 // relayEndpointInfo projects one unexported endpoint onto the reportable form.
@@ -131,10 +154,21 @@ func relayEndpointInfo(e *relayEndpoint) RelayEndpointInfo {
 // same function the media path calls, so the report cannot drift from the
 // behaviour: a copied heuristic here would be a second opinion about the one
 // thing we are trying to observe.
-func describeRelaySelection(callID string, rd *relayData, inbound bool) RelayEndpointSelection {
+func describeRelaySelection(callID string, rd *relayData, inbound, fanOut bool, bindings []relayBinding) RelayEndpointSelection {
 	sel := RelayEndpointSelection{
 		CallID: callID, Inbound: inbound, Branch: RelayBranchNone, ChosenIndex: -1,
-		InboundAndOutboundShareEndpoint: true,
+		FanOut: fanOut, Bound: []RelayEndpointInfo{},
+	}
+	for _, b := range bindings {
+		if b.ep == nil {
+			continue
+		}
+		info := relayEndpointInfo(b.ep)
+		if b.err != nil {
+			sel.Failed = append(sel.Failed, RelayBindFailure{Relay: info, Error: b.err.Error()})
+			continue
+		}
+		sel.Bound = append(sel.Bound, info)
 	}
 	if rd == nil {
 		return sel
@@ -163,11 +197,14 @@ func describeRelaySelection(callID string, rd *relayData, inbound bool) RelayEnd
 
 // reportRelaySelection emits the report once per call, through the library's
 // own logger and to the integrator's observer if one was installed.
-func (e *engine) reportRelaySelection(callID string, rd *relayData, inbound bool) {
-	sel := describeRelaySelection(callID, rd, inbound)
+func (e *engine) reportRelaySelection(callID string, rd *relayData, inbound, fanOut bool, bindings []relayBinding) {
+	sel := describeRelaySelection(callID, rd, inbound, fanOut, bindings)
 	e.c.log.Info().
 		Str("call_id", sel.CallID).
 		Bool("inbound", sel.Inbound).
+		Bool("fan_out", sel.FanOut).
+		Interface("bound", sel.Bound).
+		Interface("failed", sel.Failed).
 		Str("branch", sel.Branch).
 		Int("fna_count", sel.FNACount).
 		Int("endpoint_count", len(sel.Endpoints)).
@@ -179,6 +216,7 @@ func (e *engine) reportRelaySelection(callID string, rd *relayData, inbound bool
 		"event": "endpoint_selection", "call_id": sel.CallID, "inbound": sel.Inbound,
 		"branch": sel.Branch, "fna_count": sel.FNACount,
 		"chosen_index": sel.ChosenIndex, "endpoints": sel.Endpoints, "chosen": sel.Chosen,
+		"fan_out": sel.FanOut, "bound": sel.Bound, "failed": sel.Failed,
 	})
 	if fn := e.c.relayEndpointObserver; fn != nil {
 		fn(sel)

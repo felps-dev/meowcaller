@@ -51,8 +51,8 @@ func WithDiagnostics(rec *diag.Recorder) Option {
 }
 
 // WithRelayEndpointObserver installs a once-per-call diagnostic callback that
-// reports the offer's parsed relay endpoint list and which entry this call's
-// media was allocated on.
+// reports the offer's parsed relay endpoint list, every relay this call's
+// media was bound to (the fan-out binds all of them), and the primary.
 //
 // TEMPORARY: it exists to observe upstream issue purpshell/meowcaller#40 ("no
 // inbound audio when the offer carries no is_fna endpoint") from an integrator
@@ -61,8 +61,8 @@ func WithDiagnostics(rec *diag.Recorder) Option {
 // material, no call key, no media — because it is meant to be readable in
 // production logs.
 //
-// fn runs on the media goroutine, before the relay transport is dialled. It
-// must not block.
+// fn runs on the media goroutine, once the relays have been dialled. It must
+// not block.
 func WithRelayEndpointObserver(fn func(RelayEndpointSelection)) Option {
 	return func(c *config) { c.relayEndpointObserver = fn }
 }
