@@ -217,6 +217,14 @@ func (e *engine) onReject(ev *events.CallReject) {
 	})
 	outgoing := m.direction == CallDirectionOutgoing
 	trace := m.trace
+	// A final reject on a call we placed leaves the callee's other devices
+	// ringing; they are owed a terminate, and the list must be taken before
+	// finishCall drops the call.
+	var ringCreator types.JID
+	var ringDevices []types.JID
+	if final {
+		ringCreator, ringDevices, _ = m.takeRingDevicesLocked()
+	}
 	e.mu.Unlock()
 
 	report := CallRejectReport{
@@ -246,6 +254,9 @@ func (e *engine) onReject(ev *events.CallReject) {
 	}
 	if final {
 		e.finishCall(ev.CallID, "rejected")
+		if len(ringDevices) > 0 {
+			e.dismissAfterReject(ev.CallID, ringCreator, ringDevices, ev.From)
+		}
 	}
 }
 

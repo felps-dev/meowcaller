@@ -108,6 +108,10 @@ type engineCall struct {
 	offeredDevices     []uint16
 	preAcceptedDevices map[uint16]bool
 	rejectedDevices    map[uint16]bool
+	// ringDevices is the same offer as full device JIDs, for the
+	// <terminate> each of them is owed when the call is answered elsewhere
+	// or given up (engine_dismiss.go). Taken once, then nil.
+	ringDevices []types.JID
 }
 
 // earlyMediaRingLimit bounds how long an UNANSWERED inbound call may hold its
@@ -537,7 +541,7 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 		JID: self, CapabilityVersion: 1,
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
-	m.offeredDevices = deviceNumbers(devices)
+	m.recordOffer(devices)
 	m.trace = newCallTrace(time.Now())
 	e.mu.Unlock()
 
@@ -884,15 +888,32 @@ func (e *engine) reject(c *Call) error {
 }
 
 // hangup ends a call (either direction) and tears down its media.
+//
+// A call we placed that nobody has answered yet is ringing on every device
+// the offer reached, and WhatsApp does not fan a terminate out, so each of
+// them gets its own (engine_dismiss.go). Once it is answered, the terminate
+// goes to the answering device alone, which onAccept recorded as m.from.
 func (e *engine) hangup(c *Call) error {
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {
 		to, creator = m.from, m.creator
 	}
+	var ringing []types.JID
+	if !c.hasPeerAccepted() {
+		if ringCreator, devices, ok := e.takeRingDevices(c.id); ok {
+			creator, ringing = ringCreator, devices
+		}
+	}
+	e.finishCall(c.id, endReasonHangup)
+	if len(ringing) > 0 {
+		if err := e.sendDeviceTerminates(c.id, creator, ringing, ""); err != nil {
+			return fmt.Errorf("send terminate: %w", err)
+		}
+		return nil
+	}
 	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
 	term.Attrs["id"] = e.nextCallNodeID()
-	e.finishCall(c.id, "hangup")
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
@@ -1105,6 +1126,12 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	if m.call != nil {
 		m.call.markPeerAccepted()
 	}
+	// The callee's other devices are still ringing. Both the accept's from
+	// and the device the engine settled on are spared, so an unqualified
+	// from that the relay's election refined is never mistaken for a
+	// sibling of the device that answered.
+	settled, _ := types.ParseJID(answeringPeer)
+	e.dismissAfterAccept(ev.CallID, ev.From, settled)
 	e.c.log.Info().
 		Str("call_id", ev.CallID).
 		Str("from", ev.From.String()).
@@ -1428,10 +1455,24 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 }
 
 // onTerminate tears down a call's media and fires the Call's OnEnd listener.
+//
+// A peer's <terminate> carries a reason attribute only sometimes; a person
+// hanging up sends none, and whatsmeow reports the absent attribute as "".
+// An empty end reason is indistinguishable from "nothing said why", which is
+// how a callee hanging up on a call we placed reached the integrator as
+// reason="", so the absent attribute is reported as what it is: the peer hung
+// up. A reason the peer did send is passed through verbatim.
 func (e *engine) onTerminate(callID, reason string) {
 	e.c.log.Info().Str("call_id", callID).Str("reason", reason).Msg("call terminated")
+	if reason == "" {
+		reason = endReasonHangup
+	}
 	e.finishCall(callID, reason)
 }
+
+// endReasonHangup is the end reason for a hang-up from either side: our
+// Hangup, and a peer <terminate> that names no reason.
+const endReasonHangup = "hangup"
 
 func (e *engine) finishCall(callID, reason string) {
 	if callID == "" {
