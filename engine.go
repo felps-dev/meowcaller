@@ -76,7 +76,29 @@ type engineCall struct {
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
+
+	// Early media (upstream PR #43). An inbound 1:1 call's media starts at the
+	// offer, while it still rings, so these hold what arrives before Answer:
+	// the caller's first mute_v2 (Answer then sends the deferred <accept> from
+	// it) and the first inbound RTP (whichever of it and Answer comes second
+	// marks the call active). answered is the line between the two halves.
+	answered         bool
+	earlyMuteSeen    bool
+	earlyMuteFrom    types.JID
+	earlyMuteCreator types.JID
+	inboundSeen      bool
+	// ringLimit stops early media on a call nobody answered, in case the
+	// caller's own terminate never reaches us. Stopped by Answer and by
+	// finishCall.
+	ringLimit *time.Timer
 }
+
+// earlyMediaRingLimit bounds how long an UNANSWERED inbound call may hold its
+// early relay media. CHOSEN at the caller's own 90 s ring timeout (the figure
+// upstream PR #26 uses for its stale-offer gate): past it the call cannot be
+// answered anyway, and the sockets must not outlive it on a lost terminate.
+// A var so a test can shorten it.
+var earlyMediaRingLimit = 90 * time.Second
 
 // newEngine creates the engine for a Client.
 func newEngine(c *Client) *engine {
@@ -233,6 +255,17 @@ func (e *engine) transmitCallNode(ctx context.Context, node waBinary.Node) error
 func (e *engine) nextCallNodeID() string {
 	if e.c != nil && e.c.wa != nil {
 		return e.c.wa.GenerateMessageID()
+	}
+	var id [8]byte
+	_, _ = rand.Read(id[:])
+	return strings.ToUpper(hex.EncodeToString(id[:]))
+}
+
+// nextRequestID is the stanza id for a preaccept or accept: whatsmeow's
+// request id on a live client, random bytes in a test with no client.
+func (e *engine) nextRequestID() string {
+	if e.c != nil && e.c.wa != nil {
+		return e.c.wa.DangerousInternals().GenerateRequestID()
 	}
 	var id [8]byte
 	_, _ = rand.Read(id[:])
@@ -505,8 +538,9 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 
 // onOffer handles an inbound <offer> event: it decrypts the callKey, captures any relay
 // data, registers the Call in the Ringing phase, sends the <preaccept> eagerly (a
-// preparation step, independent of the later Answer/Reject), and fires the
-// OnIncomingCall listener. Only the <accept> is deferred to Answer.
+// preparation step, independent of the later Answer/Reject), fires the OnIncomingCall
+// listener and starts media early (see ringInbound). Only the <accept> is deferred to
+// Answer.
 func (e *engine) onOffer(ev *events.CallOffer) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
@@ -581,17 +615,81 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
 	}
 
+	e.ringInbound(ev.CallID, ev.From, ev.CallCreator, isVideo, call)
+}
+
+// ringInbound is the tail of onOffer, once the call is registered: the eager
+// <preaccept>, the integrator's OnIncomingCall listener, and the EARLY media
+// start.
+//
+// Early media is upstream PR #43. The relay only bridged the caller's audio
+// when our allocate followed the offer closely, so a call answered seconds
+// later carried outbound audio only (one integrator on our pin, Brazil: Answer
+// at +5.7..+19.3 s gave zero inbound RTP in 5/5 calls). Media now comes up
+// here, while the call still rings; the call stays CallPhaseRinging, and the
+// caller's screen stays on "Calling…" until our <accept> (verified on an
+// Android caller by the same integrator).
+//
+// One deliberate difference from #43: the listener runs BEFORE the early
+// start, so it can DeclineEarlyMedia for a call it will not take. It must
+// return promptly — the early start waits on it.
+func (e *engine) ringInbound(callID string, from, creator types.JID, isVideo bool, call *Call) {
 	// Preaccept eagerly: it is a preparation step, done independently of the later
 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
 	// the integrator decides — even a call the user goes on to decline has usually already
 	// been preaccepted.
-	if err := e.sendPreaccept(ev.CallID, ev.From, ev.CallCreator, isVideo); err != nil {
-		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
+	if err := e.sendPreaccept(callID, from, creator, isVideo); err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
 	}
 
 	if fn := e.c.incomingCallHandler(); fn != nil {
 		fn(call)
 	}
+
+	if !call.earlyMediaWanted() {
+		e.c.log.Info().Str("call_id", callID).Msg("early media declined; media waits for Answer")
+		return
+	}
+	e.armEarlyMediaRingLimit(callID)
+	e.maybeStartMedia(callID)
+}
+
+// armEarlyMediaRingLimit starts the earlyMediaRingLimit timer for a ringing
+// inbound call.
+func (e *engine) armEarlyMediaRingLimit(callID string) {
+	t := time.AfterFunc(earlyMediaRingLimit, func() { e.expireEarlyMedia(callID) })
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	m := e.calls[callID]
+	if m == nil || m.answered {
+		t.Stop()
+		return
+	}
+	m.ringLimit = t
+}
+
+// expireEarlyMedia stops the media of a call that rang past
+// earlyMediaRingLimit unanswered, and keeps it from starting again: a call
+// the caller has already given up on must not hold relay sockets. An Answer
+// that arrives after this commits to a call with no media, which the
+// integrator's own answer deadline then ends.
+func (e *engine) expireEarlyMedia(callID string) {
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil || m.answered {
+		e.mu.Unlock()
+		return
+	}
+	m.ringLimit = nil
+	cancel := m.cancel
+	m.cancel = nil
+	m.started = true
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	e.c.log.Warn().Str("call_id", callID).Dur("ring_limit", earlyMediaRingLimit).
+		Msg("unanswered call rang past the ring limit; early media stopped")
 }
 
 func (e *engine) onGroupOffer(ev *events.CallOffer, update groupCallUpdate) {
@@ -648,21 +746,23 @@ func (e *engine) sendPreaccept(callID string, to, creator types.JID, video bool)
 		callID,
 		to,
 		creator,
-		e.c.wa.DangerousInternals().GenerateRequestID(),
+		e.nextRequestID(),
 		[]string{"16000"},
 		video,
 	)
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), pre); err != nil {
+	if err := e.transmitCallNode(context.Background(), pre); err != nil {
 		return fmt.Errorf("send preaccept: %w", err)
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("preaccepted (preparation; awaiting Answer/Reject)")
 	return nil
 }
 
-// answer accepts an inbound call: it marks the call to accept (the actual <accept> is
-// deferred until the caller's <mute_v2>, which onCallRaw fires) and brings media up. The
-// <preaccept> was already sent eagerly when the offer arrived, so Answer only commits to
-// the call. Media comes up once callKey+relay are both known.
+// answer accepts an inbound call: it marks the call to accept and brings media up. The
+// actual <accept> waits for the caller's first <mute_v2>: if that already arrived while
+// the call rang (early media, upstream PR #43) the accept goes out from here, otherwise
+// onCallRaw sends it when the mute_v2 lands. The <preaccept> was already sent eagerly when
+// the offer arrived, and media is normally already running from the offer, so Answer only
+// commits to the call.
 func (e *engine) answer(c *Call) error {
 	m := e.lookup(c.id)
 	if m == nil {
@@ -681,12 +781,30 @@ func (e *engine) answer(c *Call) error {
 		e.maybeStartMedia(c.id)
 		return nil
 	}
+	c.setPhase(CallPhaseConnecting)
 	e.mu.Lock()
 	m.acceptPending = true
+	m.answered = true
+	if m.ringLimit != nil {
+		m.ringLimit.Stop()
+		m.ringLimit = nil
+	}
+	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
 	e.mu.Unlock()
 
-	c.setPhase(CallPhaseConnecting)
+	// A no-op when early media is already running; it brings media up for a
+	// call that declined it.
 	e.maybeStartMedia(c.id)
+	if muteSeen {
+		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived while ringing; sending accept")
+		e.sendAccept(c.id, from, creator)
+	}
+	if inbound {
+		c.setPhase(CallPhaseActive)
+		if fn := c.onReadyFn(); fn != nil {
+			fn()
+		}
+	}
 	return nil
 }
 
@@ -709,8 +827,8 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
 		Video:      isVideo,
 	})
-	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+	accept.Attrs["id"] = e.nextRequestID()
+	if err := e.transmitCallNode(context.Background(), accept); err != nil {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
 		return
 	}
@@ -1086,11 +1204,24 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		e.mu.Lock()
 		m := e.calls[callID]
 		pending := m != nil && m.acceptPending
+		// Early media (upstream PR #43): the caller's first mute_v2 can arrive
+		// while we still ring. It is KEPT, not acted on — there is nothing to
+		// accept yet — and Answer sends the deferred <accept> from it.
+		early := m != nil && !pending && m.direction == CallDirectionIncoming && !m.answered && !m.group
+		if early && !m.earlyMuteSeen {
+			m.earlyMuteSeen = true
+			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
+			m.earlyMuteCreator = mv.JID("call-creator")
+		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
 			if fn := m.call.onMuteStateFn(); fn != nil {
 				fn(muted)
 			}
+		}
+		if early {
+			e.c.log.Info().Str("call_id", callID).Msg("mute_v2 arrived while ringing; held for Answer")
+			return false
 		}
 		if !pending {
 			e.c.log.Debug().
@@ -1248,6 +1379,10 @@ func (e *engine) finishCall(callID, reason string) {
 	var call *Call
 	var receivers *participantReceiveRegistry
 	if m != nil {
+		if m.ringLimit != nil {
+			m.ringLimit.Stop()
+			m.ringLimit = nil
+		}
 		cancel = m.cancel
 		m.cancel = nil
 		waitingRoomCancel = m.waitingRoomCancel

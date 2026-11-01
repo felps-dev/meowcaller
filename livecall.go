@@ -46,6 +46,7 @@ type Call struct {
 	handRaises                map[types.JID]bool
 	onScreenShare             func(ScreenShareState)
 	screenShares              map[types.JID]ScreenShareState
+	earlyMediaDeclined        bool
 }
 
 // GroupCallState is a sanitized group-call roster. Transaction zero may contain
@@ -278,6 +279,27 @@ func (c *Call) Answer() error { return c.eng.answer(c) }
 
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
+
+// DeclineEarlyMedia keeps an inbound call's relay media down until Answer.
+//
+// An inbound 1:1 call's media starts at the OFFER by default, while it still
+// rings (upstream PR #43, ported in this fork): the relay bridges the caller's
+// audio only when our allocate follows the offer closely. That opens the relay
+// sockets for every offer, answered or not, so an integrator that already
+// knows it will not take a call says so here. It must be called from the
+// OnIncomingCall listener, which runs before the early start; a call it
+// reaches later is unaffected. Answer still brings media up, late.
+func (c *Call) DeclineEarlyMedia() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.earlyMediaDeclined = true
+}
+
+func (c *Call) earlyMediaWanted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.earlyMediaDeclined
+}
 
 // Hangup ends the call (either direction) and tears down media.
 func (c *Call) Hangup() error { return c.eng.hangup(c) }

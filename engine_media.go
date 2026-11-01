@@ -95,7 +95,9 @@ func (e *engine) maybeStartMedia(callID string) {
 	inbound := m.direction == CallDirectionIncoming
 	e.mu.Unlock()
 
-	if call != nil {
+	// An inbound call started EARLY (upstream PR #43) stays ringing: the
+	// media is up, but nothing is answered until Answer says so.
+	if call != nil && !(inbound && call.State() == CallPhaseRinging) {
 		call.setPhase(CallPhaseConnecting)
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
@@ -1219,12 +1221,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if rtpIn++; rtpIn == 1 {
 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
-			if call != nil {
-				call.setPhase(CallPhaseActive)
-				if fn := call.onReadyFn(); fn != nil {
-					fn()
-				}
-			}
+			e.onFirstInboundRTP(callID, call)
 		}
 	}
 }
@@ -1647,4 +1644,25 @@ func rmsFloat32(f []float32) float64 {
 		sum += float64(s) * float64(s)
 	}
 	return math.Sqrt(sum / float64(len(f)))
+}
+
+// onFirstInboundRTP marks the call active on its first inbound RTP. An
+// incoming call still RINGING (early media, upstream PR #43) only records it;
+// Answer then activates the call. The decision is taken under the engine lock
+// against answered, so whichever of the two comes second promotes the call and
+// OnReady fires exactly once.
+func (e *engine) onFirstInboundRTP(callID string, call *Call) {
+	promote := true
+	e.mu.Lock()
+	if em := e.calls[callID]; em != nil {
+		em.inboundSeen = true
+		promote = em.direction != CallDirectionIncoming || em.answered
+	}
+	e.mu.Unlock()
+	if promote && call != nil && call.State() == CallPhaseConnecting {
+		call.setPhase(CallPhaseActive)
+		if fn := call.onReadyFn(); fn != nil {
+			fn()
+		}
+	}
 }
