@@ -279,6 +279,18 @@ func TestAnIgnoredRejectDismissesNobody(t *testing.T) {
 	}
 }
 
+// An ignored reject must not use up the list: the phone answering later
+// still owes every other device its terminate, the one that declined for
+// itself included.
+func TestAnIgnoredRejectLeavesTheDevicesForTheAccept(t *testing.T) {
+	eng, _, sent := ringingOn(0, 5, 92)
+
+	eng.onReject(rejectFrom(92, nil))
+	eng.onAccept(acceptFrom(calleeDevice(0)))
+
+	assertTold(t, devicesTold(t, sent, terminateReasonAcceptedElsewhere), 5, 92)
+}
+
 // Nothing in this file applies to a call we RECEIVED: the callee never
 // dismisses its own devices.
 func TestAnInboundCallDismissesNobody(t *testing.T) {
