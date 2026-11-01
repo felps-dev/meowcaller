@@ -48,6 +48,10 @@ func (e *engine) maybeStartMedia(callID string) {
 		e.mu.Unlock()
 		return
 	}
+	if m.earlyDeclined && !m.answered {
+		e.mu.Unlock()
+		return
+	}
 	if m.group && (!m.hasGroupEpoch || len(m.groupRawEpoch) != 32 ||
 		m.groupUpdate == nil || m.groupUpdate.Relay == nil) {
 		e.c.log.Debug().
@@ -325,6 +329,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		return err
 	}
 	defer ch.Close()
+	// The receive loop checks ctx only BETWEEN datagrams, and once the call
+	// ends the relays have nothing to answer: our keepalive was the only thing
+	// they replied to. Closing the fan-out on cancellation is what unblocks the
+	// receive — without it a terminated call, or one cut by the ring limit,
+	// held every relay socket for good.
+	defer context.AfterFunc(ctx, func() { _ = ch.Close() })()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		ch.allocs[0],
 		rd.relayKeyASCII,

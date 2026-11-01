@@ -269,6 +269,13 @@ func TestADeclinedCallHasNoEarlyMedia(t *testing.T) {
 		t.Fatalf("a declined call asked for relay sockets %v before Answer", got)
 	}
 
+	// A later stanza carrying a <relay> (onRelay) must not start it either.
+	eng.maybeStartMedia("CID")
+	time.Sleep(50 * time.Millisecond)
+	if got := req.snapshot(); len(got) != 0 {
+		t.Fatalf("a declined call's media was started before Answer by a later relay stanza: %v", got)
+	}
+
 	if err := eng.answer(call); err != nil {
 		t.Fatalf("answer: %v", err)
 	}

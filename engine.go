@@ -91,6 +91,10 @@ type engineCall struct {
 	// caller's own terminate never reaches us. Stopped by Answer and by
 	// finishCall.
 	ringLimit *time.Timer
+	// earlyDeclined records the integrator's DeclineEarlyMedia, so that NO
+	// path starts this call's media before Answer — onRelay included, which
+	// starts media whenever a later stanza carries a <relay>.
+	earlyDeclined bool
 
 	// trace is the TEMPORARY election/timeline diagnostic for an inbound call
 	// (engine_call_trace.go); nil for outbound calls.
@@ -655,6 +659,11 @@ func (e *engine) ringInbound(callID string, from, creator types.JID, isVideo boo
 	}
 
 	if !call.earlyMediaWanted() {
+		e.mu.Lock()
+		if m := e.calls[callID]; m != nil {
+			m.earlyDeclined = true
+		}
+		e.mu.Unlock()
 		e.c.log.Info().Str("call_id", callID).Msg("early media declined; media waits for Answer")
 		return
 	}
