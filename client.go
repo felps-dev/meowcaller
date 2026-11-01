@@ -35,6 +35,10 @@ type Client struct {
 	// (WithMediaCensusObserver, engine_media_census.go).
 	mediaCensusObserver func(MediaCensus)
 
+	// callRejectObserver reports each <reject> and its decision
+	// (WithCallRejectObserver, engine_reject.go).
+	callRejectObserver func(CallRejectReport)
+
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
 
@@ -67,6 +71,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 		mediaPacketConn:       cfg.mediaPacketConn,
 		relayEndpointObserver: cfg.relayEndpointObserver,
 		mediaCensusObserver:   cfg.mediaCensusObserver,
+		callRejectObserver:    cfg.callRejectObserver,
 		getGroupInfo:          wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}

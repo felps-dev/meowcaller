@@ -96,9 +96,18 @@ type engineCall struct {
 	// starts media whenever a later stanza carries a <relay>.
 	earlyDeclined bool
 
-	// trace is the TEMPORARY election/timeline diagnostic for an inbound call
-	// (engine_call_trace.go); nil for outbound calls.
+	// trace is the TEMPORARY election/timeline diagnostic
+	// (engine_call_trace.go). An outbound call has one too, for the rejects
+	// its callee's devices send.
 	trace *callTrace
+
+	// The callee's devices on a call we placed (engine_reject.go): every
+	// device the offer was addressed to, the ones that preaccepted (rang),
+	// and the ones that have rejected. A reject is final only by what these
+	// say about the CALLEE, not about one of their devices.
+	offeredDevices     []uint16
+	preAcceptedDevices map[uint16]bool
+	rejectedDevices    map[uint16]bool
 }
 
 // earlyMediaRingLimit bounds how long an UNANSWERED inbound call may hold its
@@ -528,6 +537,8 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 		JID: self, CapabilityVersion: 1,
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
+	m.offeredDevices = deviceNumbers(devices)
+	m.trace = newCallTrace(time.Now())
 	e.mu.Unlock()
 
 	e.c.diag.Emit("keying", map[string]any{
@@ -1022,6 +1033,7 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
 	if m.call != nil && m.call.State() == CallPhaseCalling {
 		m.call.setPhase(CallPhaseRinging)
 	}
+	e.recordPreAccept(ev.CallID, ev.From)
 	if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
 		e.mu.Lock()
 		if current := e.calls[ev.CallID]; current != nil {
@@ -1142,22 +1154,6 @@ func preferQualifiedPeer(current string, signaled types.JID) string {
 		return current
 	}
 	return signaled.String()
-}
-
-// onReject tears down an outgoing call when the peer declines it.
-func (e *engine) onReject(ev *events.CallReject) {
-	m := e.lookup(ev.CallID)
-	if m == nil {
-		return
-	}
-	e.c.log.Info().
-		Str("call_id", ev.CallID).
-		Str("from", ev.From.String()).
-		Msg("peer rejected call")
-	e.c.diag.Emit("meta", map[string]any{
-		"event": "peer_reject", "call_id": ev.CallID, "from": ev.From.String(),
-	})
-	e.finishCall(ev.CallID, "rejected")
 }
 
 // rlProbe is one relay candidate from a relaylatency probe.

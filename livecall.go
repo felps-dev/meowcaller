@@ -745,6 +745,13 @@ func (c *Call) OnPeerAccept(fn func()) {
 	}
 }
 
+// hasPeerAccepted reports whether the callee of an outgoing call accepted.
+func (c *Call) hasPeerAccepted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peerAccepted
+}
+
 func (c *Call) markPeerAccepted() {
 	c.mu.Lock()
 	c.peerAccepted = true

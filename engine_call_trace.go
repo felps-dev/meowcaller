@@ -22,8 +22,9 @@ import (
 	"time"
 )
 
-// CensusTimeline is one inbound call's milestones, in milliseconds since its
-// offer arrived. A nil field has not happened (yet).
+// CensusTimeline is one call's milestones, in milliseconds since its offer
+// arrived (or, for a call we placed, since it left). A nil field has not
+// happened (yet).
 type CensusTimeline struct {
 	// CallKeyMS: the offer's call key decrypted.
 	CallKeyMS *int64 `json:"callkey_ms,omitempty"`
@@ -53,10 +54,26 @@ type CensusTrace struct {
 	ProbedRelays  map[string]uint64 `json:"probed_relays,omitempty"`
 	SkippedRelays map[string]uint64 `json:"skipped_relays,omitempty"`
 	Timeline      CensusTimeline    `json:"timeline"`
+	// DeviceRejects is every <reject> the call received, in order, with the
+	// device that sent it and what the engine decided (engine_reject.go).
+	// Not part of the temporary #40 set: it is how an outbound call that
+	// ended, or did not, on a companion's reject is read afterwards.
+	DeviceRejects []CensusReject `json:"device_rejects,omitempty"`
 }
 
-// callTrace collects a CensusTrace for one call. Methods are nil-safe: an
-// outbound call has none.
+// CensusReject is one reject on a call's trace.
+type CensusReject struct {
+	// MS is milliseconds since the offer, on the timeline's clock.
+	MS     int64  `json:"ms"`
+	Device uint16 `json:"device"`
+	Count  string `json:"count,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Final  bool   `json:"final"`
+	Rule   string `json:"rule"`
+}
+
+// callTrace collects a CensusTrace for one call. Methods are nil-safe: a call
+// built without one (a group call, a test fixture) simply records nothing.
 type callTrace struct {
 	offer time.Time
 
@@ -149,6 +166,19 @@ func (t *callTrace) probes(probed, skipped []string) {
 	}
 }
 
+// reject records one reject and its decision.
+func (t *callTrace) reject(r CallRejectReport) {
+	if t == nil {
+		return
+	}
+	ms := time.Since(t.offer).Milliseconds()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.trace.DeviceRejects = append(t.trace.DeviceRejects, CensusReject{
+		MS: ms, Device: r.Device, Count: r.Count, Reason: r.Reason, Final: r.Final, Rule: r.Rule,
+	})
+}
+
 // snapshot deep-copies the trace for a census emission.
 func (t *callTrace) snapshot() *CensusTrace {
 	if t == nil {
@@ -160,6 +190,7 @@ func (t *callTrace) snapshot() *CensusTrace {
 		OfferRelays:   append([]string(nil), t.trace.OfferRelays...),
 		ProbedRelays:  copyCensusCounters(t.trace.ProbedRelays),
 		SkippedRelays: copyCensusCounters(t.trace.SkippedRelays),
+		DeviceRejects: append([]CensusReject(nil), t.trace.DeviceRejects...),
 	}
 	tl := t.trace.Timeline
 	for _, p := range []**int64{&tl.CallKeyMS, &tl.MediaStartMS, &tl.MuteV2MS, &tl.AnswerMS, &tl.AcceptSentMS, &tl.FirstRTPMS} {

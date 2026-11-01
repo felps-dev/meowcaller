@@ -24,6 +24,10 @@ type config struct {
 	// mediaCensusObserver is the temporary issue-#40 receive-path census hook.
 	// See WithMediaCensusObserver and engine_media_census.go.
 	mediaCensusObserver func(MediaCensus)
+
+	// callRejectObserver reports every <reject> and what the engine decided
+	// about it. See WithCallRejectObserver and engine_reject.go.
+	callRejectObserver func(CallRejectReport)
 }
 
 func resolveConfig(opts []Option) config {

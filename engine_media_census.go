@@ -327,8 +327,8 @@ type MediaCensus struct {
 	// through another relay. Non-zero means two relays bridged the caller.
 	Duplicates uint64 `json:"duplicates"`
 
-	// Trace is the relay election and the offer->media->answer timeline, for
-	// an inbound call (engine_call_trace.go).
+	// Trace is the relay election, the offer->media->answer timeline and the
+	// rejects the call received (engine_call_trace.go).
 	Trace *CensusTrace `json:"trace,omitempty"`
 }
 
@@ -464,7 +464,7 @@ type mediaCensus struct {
 	// Per-relay inbound, indexed like relayNames (the fan-out's order).
 	relayNames []string
 	relays     []CensusRelay
-	// trace is the call's election/timeline collector, nil for outbound.
+	// trace is the call's election/timeline collector, nil when it has none.
 	trace *callTrace
 }
 
